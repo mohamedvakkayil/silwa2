@@ -726,9 +726,29 @@ main {
     background: #f9f9f9;
 }
 
-.mdb-data-table tbody tr:hover {
-    background: #f0f0f0;
+.mdb-data-table tbody tr[data-item-name].clickable-row {
     cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+}
+
+.mdb-data-table tbody tr[data-item-name].clickable-row:hover {
+    background: #e8f0fe !important;
+    transform: translateX(2px);
+}
+
+.mdb-data-table tbody tr[data-item-name].clickable-row:active {
+    transform: translateX(0);
+    background: #d0e7ff !important;
+}
+
+.mdb-data-table tbody tr[data-item-name].non-clickable-row {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.mdb-data-table tbody tr[data-item-name].non-clickable-row:hover {
+    background: #f5f5f5 !important;
+    transform: none;
 }
 
 .mdb-data-table .kind-rmu {

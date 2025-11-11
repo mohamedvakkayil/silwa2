@@ -943,17 +943,24 @@ function showDetails(item) {
 }
 
 // Open detailed page with metadata and Excel sheet data
-function openDetailedPage(item, nodeName) {
+function openDetailedPage(item, nodeName, sourceView = 'main') {
     const detailedPage = document.getElementById('detailed-page');
     const detailedTitle = document.getElementById('detailed-title');
     const metadataContent = document.getElementById('metadata-content');
     const detailedDataContent = document.getElementById('detailed-data-content');
     
-    // Hide main content
-    document.querySelector('main > .controls').style.display = 'none';
-    document.querySelector('main > .legend-panel').style.display = 'none';
-    document.querySelector('main > .info-panel').style.display = 'none';
-    document.getElementById('main-content').style.display = 'none';
+    // Store the source view so we know where to return
+    detailedPage.setAttribute('data-source-view', sourceView);
+    
+    // Hide main content or MDB view based on source
+    if (sourceView === 'mdb') {
+        document.getElementById('mdb-view-page').classList.add('hidden');
+    } else {
+        document.querySelector('main > .controls').style.display = 'none';
+        document.querySelector('main > .legend-panel').style.display = 'none';
+        document.querySelector('main > .info-panel').style.display = 'none';
+        document.getElementById('main-content').style.display = 'none';
+    }
     document.getElementById('details-panel').classList.add('hidden');
     
     // Show detailed page
@@ -1807,13 +1814,21 @@ function displayDetailedTable(data, container, sheetName, providedHeaders = null
 // Close detailed page and return to diagram
 function closeDetailedPage() {
     const detailedPage = document.getElementById('detailed-page');
+    const sourceView = detailedPage.getAttribute('data-source-view') || 'main';
+    
     detailedPage.classList.add('hidden');
     
-    // Show main content
-    document.querySelector('main > .controls').style.display = 'block';
-    document.querySelector('main > .legend-panel').style.display = 'block';
-    document.querySelector('main > .info-panel').style.display = 'block';
-    document.getElementById('main-content').style.display = 'flex';
+    // Return to the appropriate view based on source
+    if (sourceView === 'mdb') {
+        // Return to MDB view
+        document.getElementById('mdb-view-page').classList.remove('hidden');
+    } else {
+        // Return to main content
+        document.querySelector('main > .controls').style.display = 'block';
+        document.querySelector('main > .legend-panel').style.display = 'block';
+        document.querySelector('main > .info-panel').style.display = 'block';
+        document.getElementById('main-content').style.display = 'flex';
+    }
 }
 
 // Event listeners
@@ -2231,7 +2246,21 @@ function generateMDBTable(data, mdbName) {
         const collapseId = `collapse-${mdbName}-${groupIndex}`;
         
         // Parent row (SMDB, ESMDB, MCC or other parent)
-        html += `<tr class="mdb-parent-row ${hasChildren && isParentType ? 'has-children' : ''}" data-row-id="${rowId}" data-collapse-id="${collapseId}">`;
+        const isClickable = estimate > 0;
+        const clickableClass = isClickable ? 'clickable-row' : 'non-clickable-row';
+        // Ensure data is properly serialized - use itemdrop or name to find original data if node.data is empty
+        let rowData = parentRow.data || {};
+        if (!rowData || Object.keys(rowData).length === 0) {
+            // Try to find data from allData if available
+            const itemName = parentRow.name || parentRow.itemdrop || '';
+            if (itemName && window.allData) {
+                const foundData = window.allData.find(d => (d.Itemdrop || d.MDB) === itemName);
+                if (foundData) {
+                    rowData = foundData;
+                }
+            }
+        }
+        html += `<tr class="mdb-parent-row ${hasChildren && isParentType ? 'has-children' : ''} ${clickableClass}" data-row-id="${rowId}" data-collapse-id="${collapseId}" data-item-name="${parentRow.name || ''}" data-item-data='${JSON.stringify(rowData)}' data-estimate="${estimate}">`;
         html += `<td>${indent}`;
         if (hasChildren && isParentType) {
             html += `<span class="collapse-toggle" style="cursor: pointer; margin-right: 5px; user-select: none;">▶</span>`;
@@ -2252,8 +2281,21 @@ function generateMDBTable(data, mdbName) {
                 const childEstimate = parseFloat(childRow.estimate) || 0;
                 const childIsRecalculated = childRow.recalculated || false;
                 const childRowClass = `mdb-child-row ${collapseId}`;
-                
-                html += `<tr class="${childRowClass}" style="display: none;">`;
+                const childIsClickable = childEstimate > 0;
+                const childClickableClass = childIsClickable ? 'clickable-row' : 'non-clickable-row';
+                // Ensure data is properly serialized - use itemdrop or name to find original data if node.data is empty
+                let childRowData = childRow.data || {};
+                if (!childRowData || Object.keys(childRowData).length === 0) {
+                    // Try to find data from allData if available
+                    const childItemName = childRow.name || childRow.itemdrop || '';
+                    if (childItemName && window.allData) {
+                        const foundData = window.allData.find(d => (d.Itemdrop || d.MDB) === childItemName);
+                        if (foundData) {
+                            childRowData = foundData;
+                        }
+                    }
+                }
+                html += `<tr class="${childRowClass} ${childClickableClass}" style="display: none;" data-item-name="${childRow.name || ''}" data-item-data='${JSON.stringify(childRowData)}' data-estimate="${childEstimate}">`;
                 html += `<td>${childIndent}${childRow.name || ''}${childIsRecalculated ? ' <span style="color: #4CAF50; font-size: 0.85em;">(recalculated)</span>' : ''}</td>`;
                 html += `<td><span class="${childKindClass}">${childRow.kind || ''}</span></td>`;
                 html += `<td>${childRow.load || '0 kW'}</td>`;
@@ -2321,10 +2363,8 @@ function setupMDBTableCollapse(mdbName) {
         console.log(`Row ${index}: collapseId=${collapseId}, childRows=${childRows.length}`);
         
         if (childRows.length > 0) {
-            parentRow.style.cursor = 'pointer';
-            
-            // Remove any existing listeners by using a named function
-            const clickHandler = function(e) {
+            // Collapse handler - only for toggle icon
+            const collapseHandler = function(e) {
                 e.preventDefault();
                 e.stopPropagation();
                 
@@ -2341,10 +2381,84 @@ function setupMDBTableCollapse(mdbName) {
                 console.log(`Toggled ${collapseId}: ${isCollapsed ? 'expanded' : 'collapsed'}`);
             };
             
-            parentRow.addEventListener('click', clickHandler);
-            
-            // Also make toggle clickable
-            toggle.addEventListener('click', clickHandler);
+            // Only attach collapse handler to toggle icon
+            toggle.addEventListener('click', collapseHandler);
+        }
+        
+        // Add click handler for opening detailed page (for all parent rows with non-zero estimates)
+        const itemName = parentRow.getAttribute('data-item-name');
+        const itemDataStr = parentRow.getAttribute('data-item-data');
+        const rowEstimate = parseFloat(parentRow.getAttribute('data-estimate')) || 0;
+        
+        if (itemName && itemDataStr && rowEstimate > 0) {
+            parentRow.style.cursor = 'pointer';
+            parentRow.setAttribute('data-click-handler', 'true');
+            parentRow.addEventListener('click', function(e) {
+                // Don't trigger if clicking on collapse toggle
+                if (e.target.classList.contains('collapse-toggle') || 
+                    e.target.closest('.collapse-toggle')) {
+                    return;
+                }
+                
+                try {
+                    const itemData = JSON.parse(itemDataStr);
+                    openDetailedPage(itemData, itemName, 'mdb');
+                } catch (err) {
+                    console.error('Error parsing item data:', err);
+                    openDetailedPage(null, itemName, 'mdb');
+                }
+            });
+        } else if (rowEstimate === 0) {
+            // Make non-clickable rows visually distinct
+            parentRow.style.cursor = 'not-allowed';
+            parentRow.style.opacity = '0.6';
+        }
+    });
+    
+    // Add click handlers for ALL rows with non-zero estimates (including MDB, PFC, BusBarRaiser, etc.)
+    const allRowsWithData = table.querySelectorAll('tr[data-item-name]');
+    allRowsWithData.forEach(row => {
+        const itemName = row.getAttribute('data-item-name');
+        const itemDataStr = row.getAttribute('data-item-data');
+        const rowEstimate = parseFloat(row.getAttribute('data-estimate')) || 0;
+        
+        // Skip if already has click handler (parent rows processed above)
+        if (row.hasAttribute('data-click-handler')) {
+            return;
+        }
+        
+        // Only make clickable if estimate > 0 and has valid data
+        if (itemName && itemDataStr && rowEstimate > 0) {
+            row.style.cursor = 'pointer';
+            row.setAttribute('data-click-handler', 'true');
+            row.addEventListener('click', function(e) {
+                // Don't trigger if clicking on collapse toggle
+                if (e.target.classList.contains('collapse-toggle') || 
+                    e.target.closest('.collapse-toggle')) {
+                    return;
+                }
+                
+                try {
+                    const itemData = JSON.parse(itemDataStr);
+                    console.log('Opening detailed page for:', itemName, 'Data:', itemData);
+                    openDetailedPage(itemData, itemName, 'mdb');
+                } catch (err) {
+                    console.error('Error parsing item data:', err, 'Item:', itemName, 'Data string:', itemDataStr);
+                    openDetailedPage(null, itemName, 'mdb');
+                }
+            });
+        } else if (rowEstimate === 0) {
+            // Make non-clickable rows visually distinct
+            row.style.cursor = 'not-allowed';
+            row.style.opacity = '0.6';
+        } else {
+            // Debug: log rows that should be clickable but aren't
+            console.warn('Row not clickable:', {
+                itemName,
+                hasData: !!itemDataStr,
+                estimate: rowEstimate,
+                row: row
+            });
         }
     });
 }

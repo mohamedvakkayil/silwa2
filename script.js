@@ -6,6 +6,117 @@ let g = null;
 let zoom = null;
 let nodeMap = new Map();
 
+// Password Protection
+const SITE_PASSWORD = 'Technoplus2024'; // Change this to your desired password
+
+// Check authentication status
+function checkAuthentication() {
+    const isAuthenticated = sessionStorage.getItem('authenticated') === 'true';
+    return isAuthenticated;
+}
+
+// Show login modal
+function showLoginModal() {
+    const loginModal = document.getElementById('loginModal');
+    const mainContent = document.getElementById('mainSiteContent');
+    
+    if (loginModal) {
+        loginModal.classList.remove('hidden');
+    }
+    if (mainContent) {
+        mainContent.classList.add('hidden');
+    }
+}
+
+// Hide login modal and show main content
+function hideLoginModal() {
+    const loginModal = document.getElementById('loginModal');
+    const mainContent = document.getElementById('mainSiteContent');
+    
+    if (loginModal) {
+        loginModal.classList.add('hidden');
+    }
+    if (mainContent) {
+        mainContent.classList.remove('hidden');
+    }
+}
+
+// Handle login form submission
+function handleLogin(event) {
+    event.preventDefault();
+    
+    const passwordInput = document.getElementById('passwordInput');
+    const errorMessage = document.getElementById('errorMessage');
+    const enteredPassword = passwordInput.value.trim();
+    
+    // Clear previous error
+    if (errorMessage) {
+        errorMessage.classList.remove('show');
+        errorMessage.textContent = '';
+    }
+    
+    // Check password
+    if (enteredPassword === SITE_PASSWORD) {
+        // Set authentication
+        sessionStorage.setItem('authenticated', 'true');
+        
+        // Hide login modal and show main content
+        hideLoginModal();
+        
+        // Load data after authentication
+        loadData();
+    } else {
+        // Show error message
+        if (errorMessage) {
+            errorMessage.textContent = 'Incorrect password. Please try again.';
+            errorMessage.classList.add('show');
+        }
+        
+        // Clear password input
+        passwordInput.value = '';
+        passwordInput.focus();
+        
+        // Shake animation
+        const loginBox = document.querySelector('.login-box');
+        if (loginBox) {
+            loginBox.style.animation = 'shake 0.5s';
+            setTimeout(() => {
+                loginBox.style.animation = '';
+            }, 500);
+        }
+    }
+}
+
+// Initialize authentication on page load
+document.addEventListener('DOMContentLoaded', function() {
+    // Check if user is already authenticated
+    if (checkAuthentication()) {
+        hideLoginModal();
+        // Load data after a short delay to ensure DOM is ready
+        setTimeout(() => {
+            loadData();
+        }, 100);
+    } else {
+        showLoginModal();
+    }
+    
+    // Set up login form handler
+    const loginForm = document.getElementById('loginForm');
+    if (loginForm) {
+        loginForm.addEventListener('submit', handleLogin);
+    }
+    
+    // Allow Enter key to submit
+    const passwordInput = document.getElementById('passwordInput');
+    if (passwordInput) {
+        passwordInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                handleLogin(e);
+            }
+        });
+    }
+});
+
 // Load data from embedded JavaScript file
 function loadData() {
     // Wait a bit for data.js to load if needed
@@ -2519,5 +2630,5 @@ function groupDataByParent(data) {
     return groups;
 }
 
-// Initialize on page load
-document.addEventListener('DOMContentLoaded', loadData);
+// Note: loadData() is now called from the authentication handler after successful login
+// The original DOMContentLoaded listener has been moved to the authentication section

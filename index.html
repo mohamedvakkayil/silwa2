@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Silwa Tower Estimation - Technoplus</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="data.js"></script>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Silwa Tower Estimation</h1>
+            <p class="subtitle">by Technoplus</p>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="controls">
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="Search items...">
+                <button id="searchBtn">Search</button>
+            </div>
+            <div class="filter-box">
+                <label for="kindFilter">Filter by Kind:</label>
+                <select id="kindFilter">
+                    <option value="">All</option>
+                </select>
+            </div>
+            <div class="view-controls">
+                <button id="resetView" class="btn">Reset</button>
+                <button id="fitView" class="btn">Fit</button>
+                <button id="expandAll" class="btn">Expand</button>
+                <button id="collapseAll" class="btn">Collapse</button>
+                <button id="toggleTreeView" class="btn">Tree View</button>
+                <button id="showMDBView" class="btn btn-primary">MDB View</button>
+            </div>
+        </div>
+        
+        <div class="legend-panel">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px;">
+                <div>
+                    <h4 style="margin: 0 0 10px 0;">Legend:</h4>
+                    <div class="legend-items">
+                        <span class="legend-item"><span class="legend-color" style="background: #667eea;"></span> RMU</span>
+                        <span class="legend-item"><span class="legend-color" style="background: #FF6B6B;"></span> MDB</span>
+                        <span class="legend-item"><span class="legend-color" style="background: #4ECDC4;"></span> Bus Bar</span>
+                        <span class="legend-item"><span class="legend-color" style="background: #95E1D3;"></span> SMDB</span>
+                        <span class="legend-item"><span class="legend-color" style="background: #A8E6CF;"></span> DB</span>
+                        <span class="legend-item"><span class="legend-color" style="background: #FFE66D;"></span> Other</span>
+                    </div>
+                </div>
+                <div class="instructions">
+                    <small style="color: #666;">
+                        <strong>Tips:</strong> Click nodes to expand/collapse • Double-click for details • Use mouse wheel to zoom • Drag to pan
+                    </small>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-panel">
+            <div class="stats">
+                <div class="stat-item">
+                    <span class="stat-label">Total Items:</span>
+                    <span class="stat-value" id="totalItems">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Total Load:</span>
+                    <span class="stat-value" id="totalLoad">0 kW</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Total Estimate:</span>
+                    <span class="stat-value" id="totalEstimate">0</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="main-content" class="main-content">
+            <div id="tree-sidebar" class="tree-sidebar hidden">
+                <div class="sidebar-header">
+                    <h3>Navigation Tree</h3>
+                    <button id="closeTreeView" class="close-btn-small">&times;</button>
+                </div>
+                <div id="treeView" class="tree-view"></div>
+            </div>
+            <div id="mindmap-container" class="mindmap-container-main">
+                <div class="zoom-controls">
+                    <button id="zoomIn" class="zoom-btn">+</button>
+                    <button id="zoomOut" class="zoom-btn">−</button>
+                    <button id="zoomReset" class="zoom-btn">⌂</button>
+                </div>
+                <div id="mindmap"></div>
+            </div>
+        </div>
+
+        <div id="details-panel" class="details-panel hidden">
+            <button id="closeDetails" class="close-btn">&times;</button>
+            <h3>Item Details</h3>
+            <div id="detailsContent"></div>
+        </div>
+        
+        <!-- Detailed Page View -->
+        <div id="detailed-page" class="detailed-page hidden">
+            <div class="detailed-header">
+                <button id="backToHome" class="back-btn">← Back to Diagram</button>
+                <h2 id="detailed-title">Item Details</h2>
+            </div>
+            <div class="detailed-content">
+                <div class="metadata-section">
+                    <h3>Metadata</h3>
+                    <div id="metadata-content"></div>
+                </div>
+                <div class="detailed-data-section">
+                    <h3>Detailed Data</h3>
+                    <div id="detailed-data-content">
+                        <div class="loading">Loading detailed data...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- MDB View Page -->
+        <div id="mdb-view-page" class="mdb-view-page hidden">
+            <div class="mdb-view-header">
+                <button id="backToHomeFromMDB" class="back-btn">← Back to Diagram</button>
+                <h2>MDB View</h2>
+            </div>
+            <div class="mdb-view-content">
+                <div class="mdb-tabs">
+                    <button class="mdb-tab active" data-mdb="MDB1">MDB1</button>
+                    <button class="mdb-tab" data-mdb="MDB2">MDB2</button>
+                    <button class="mdb-tab" data-mdb="MDB3">MDB3</button>
+                    <button class="mdb-tab" data-mdb="MDB4">MDB4</button>
+                </div>
+                <div class="mdb-tab-content">
+                    <div id="mdb-table-container"></div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2024 Technoplus. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
+

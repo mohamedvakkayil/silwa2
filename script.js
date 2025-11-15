@@ -6,6 +6,48 @@ let g = null;
 let zoom = null;
 let nodeMap = new Map();
 
+// Performance optimization: Production mode flag
+const PRODUCTION_MODE = true; // Set to false for debugging
+
+// Optimized console logging (disabled in production)
+const logger = {
+    log: PRODUCTION_MODE ? () => {} : console.log.bind(console),
+    warn: PRODUCTION_MODE ? () => {} : console.warn.bind(console),
+    error: console.error.bind(console), // Always show errors
+    info: PRODUCTION_MODE ? () => {} : console.info.bind(console)
+};
+
+// Cache for resolved formulas
+const formulaCache = new Map();
+
+// Cache for loaded sheets
+const sheetCache = new Map();
+
+// Debounce function for expensive operations
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+// Throttle function for frequent operations
+function throttle(func, limit) {
+    let inThrottle;
+    return function(...args) {
+        if (!inThrottle) {
+            func.apply(this, args);
+            inThrottle = true;
+            setTimeout(() => inThrottle = false, limit);
+        }
+    };
+}
+
 // Password Protection
 const SITE_PASSWORD = 'Technoplus2024'; // Change this to your desired password
 
@@ -63,8 +105,10 @@ function handleLogin(event) {
         // Hide login modal and show main content
         hideLoginModal();
         
-        // Load data after authentication
+            // Load data after authentication
         loadData();
+        // Start automatic syncing
+        startAutoSync();
     } else {
         // Show error message
         if (errorMessage) {
@@ -95,6 +139,8 @@ document.addEventListener('DOMContentLoaded', function() {
         // Load data after a short delay to ensure DOM is ready
         setTimeout(() => {
             loadData();
+            // Start automatic syncing
+            startAutoSync();
         }, 100);
     } else {
         showLoginModal();
@@ -117,68 +163,766 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 });
 
-// Load data from embedded JavaScript file
-function loadData() {
-    // Wait a bit for data.js to load if needed
-    const checkData = () => {
-        try {
-            // Access global allData from data.js (declared as var, so it's on window)
-            let data = null;
-            
-            // Check multiple ways to access allData
-            if (typeof window !== 'undefined' && window.allData) {
-                data = window.allData;
-            } else if (typeof allData !== 'undefined') {
-                data = allData;
-                window.allData = data; // Store on window for consistency
-            }
-            
-            if (data && Array.isArray(data) && data.length > 0) {
-                console.log('Data loaded:', data.length, 'items');
-                window.allData = data;
-                processData();
-                initializeDiagram();
-                updateStats();
-                populateFilters();
-            } else {
-                // Fallback: try to fetch from JSON file
-                console.log('Trying to fetch data.json...');
-                fetch('data.json')
-                    .then(response => {
-                        if (!response.ok) throw new Error('Failed to fetch');
-                        return response.json();
-                    })
-                    .then(data => {
-                        console.log('Data loaded from JSON:', data.length, 'items');
-                        window.allData = data;
-                        processData();
-                        initializeDiagram();
-                        updateStats();
-                        populateFilters();
-                    })
-                    .catch(error => {
-                        console.error('Error loading data:', error);
-                        document.getElementById('mindmap').innerHTML = 
-                            '<div style="padding: 20px; text-align: center; color: #666;">Error loading data. Please ensure data.js exists.<br><small>' + error.message + '</small></div>';
-                    });
-            }
-        } catch (error) {
-            console.error('Error loading data:', error);
-            document.getElementById('mindmap').innerHTML = 
-                '<div style="padding: 20px; text-align: center; color: #666;">Error loading data: ' + error.message + '</div>';
-        }
-    };
+// Excel file configuration
+const EXCEL_FILE_NAME = 'e2.xlsx';
+
+// Helper function to normalize MDB values (MDB -> MDB1, MDB.GF.04 -> MDB4, except for KIND field)
+function normalizeMDB(mdbValue) {
+    if (!mdbValue || typeof mdbValue !== 'string') {
+        return mdbValue || '';
+    }
+    const trimmed = mdbValue.trim().toUpperCase();
+    // Normalize "MDB" to "MDB1" (case-insensitive)
+    if (trimmed === 'MDB') {
+        return 'MDB1';
+    }
+    // Normalize "MDB.GF.04" to "MDB4"
+    if (trimmed === 'MDB.GF.04' || trimmed === 'MDB GF 04') {
+        return 'MDB4';
+    }
+    return mdbValue;
+}
+
+// Helper function to parse load value and extract numeric kW (exclude KVAR)
+function parseLoadValue(loadStr) {
+    if (!loadStr || typeof loadStr !== 'string') {
+        return 0;
+    }
     
-    // Check immediately, and if no data, wait a bit and check again
-    checkData();
-    if (!window.allData && typeof allData === 'undefined') {
-        setTimeout(checkData, 100);
+    // Check if it contains KVAR - exclude it
+    const upperStr = loadStr.toUpperCase();
+    if (upperStr.includes('KVAR')) {
+        return 0; // KVAR is not load, exclude it
+    }
+    
+    // Extract numeric value (handles formats like "1893.42 kW", "1893.42kW", etc.)
+    const match = loadStr.match(/(\d+\.?\d*)/);
+    if (match) {
+        return parseFloat(match[1]) || 0;
+    }
+    
+    return 0;
+}
+
+// Extract NO OF UNITS from a detailed sheet (row immediately after SUM AFTER LABOUR)
+async function extractNoOfUnitsFromSheet(sheetName) {
+    try {
+        const response = await fetch(EXCEL_FILE_NAME);
+        if (!response.ok) {
+            logger.warn(`Could not load Excel file to extract NO OF UNITS for ${sheetName}`);
+            return null;
+        }
+        const arrayBuffer = await response.arrayBuffer();
+        const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+        
+        // Normalize sheet name (MDB -> MDB1, MDB.GF.04 -> MDB4)
+        const normalizedSheetName = normalizeMDB(sheetName);
+        let worksheet = workbook.Sheets[normalizedSheetName] || workbook.Sheets[sheetName];
+        
+        if (!worksheet) {
+            logger.warn(`Sheet not found: ${sheetName} or ${normalizedSheetName}`);
+            return null;
+        }
+        
+        // Convert sheet to JSON
+        const sheetData = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+        
+        if (!sheetData || sheetData.length === 0) {
+            return null;
+        }
+        
+        // Find ITEM and AMOUNT columns
+        let itemColumnIndex = -1;
+        let amountColumnIndex = -1;
+        
+        // Search headers in first few rows
+        for (let rowIdx = 0; rowIdx < Math.min(5, sheetData.length); rowIdx++) {
+            const row = sheetData[rowIdx];
+            if (!row || row.length === 0) continue;
+            
+            for (let colIdx = 0; colIdx < row.length; colIdx++) {
+                const cellValue = (row[colIdx] || '').toString().toLowerCase().trim();
+                if (cellValue === 'item' || cellValue === 'items') {
+                    itemColumnIndex = colIdx;
+                }
+                if (cellValue === 'amount') {
+                    amountColumnIndex = colIdx;
+                }
+            }
+            
+            if (itemColumnIndex !== -1 && amountColumnIndex !== -1) break;
+        }
+        
+        if (itemColumnIndex === -1 || amountColumnIndex === -1) {
+            logger.warn(`Could not find ITEM or AMOUNT columns in sheet ${sheetName}`);
+            return null;
+        }
+        
+        // Find SUM AFTER LABOUR row
+        let sumAfterLabourIndex = -1;
+        for (let rowIdx = 0; rowIdx < sheetData.length; rowIdx++) {
+            const row = sheetData[rowIdx];
+            if (!row || row.length === 0) continue;
+            
+            const itemValue = row[itemColumnIndex];
+            if (itemValue) {
+                const itemStr = itemValue.toString().toLowerCase().trim();
+                if (itemStr.includes('sum after labour') || itemStr.includes('sum after labor')) {
+                    sumAfterLabourIndex = rowIdx;
+                    break;
+                }
+            }
+        }
+        
+        if (sumAfterLabourIndex === -1) {
+            logger.warn(`Could not find SUM AFTER LABOUR in sheet ${sheetName}`);
+            return null;
+        }
+        
+        // Get NO OF UNITS from row immediately after SUM AFTER LABOUR
+        const noOfUnitsRow = sheetData[sumAfterLabourIndex + 1];
+        if (!noOfUnitsRow || noOfUnitsRow.length === 0) {
+            return null;
+        }
+        
+        const amountValue = noOfUnitsRow[amountColumnIndex];
+        if (amountValue !== null && amountValue !== undefined && amountValue !== '') {
+            const parsed = parseFloat(amountValue);
+            if (!isNaN(parsed) && parsed > 0) {
+                logger.log(`✓ Extracted NO OF UNITS from ${sheetName}: ${parsed}`);
+                return parsed;
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error(`Error extracting NO OF UNITS from sheet ${sheetName}:`, error);
+        return null;
     }
 }
 
-// Helper function to get DB copy counts for special SMDBs
-function getDBCopyCounts(smdbName) {
-    const normalized = smdbName.replace(/\.01$/, '');
+// Calculate sum of immediate children loads for a board (MDB, SMDB, ESMDB, MCC, etc.) excluding KVAR
+async function calculateChildrenLoadSum(boardName, boardNode = null) {
+    // If boardNode is provided, use it directly (for recursive calls)
+    let targetNode = boardNode;
+    
+    if (!targetNode) {
+        if (!treeData || !treeData.children) {
+            logger.warn(`Tree data not available for load calculation: ${boardName}`);
+            return 0;
+        }
+        
+        // Search recursively through the tree to find the board node
+        function findNode(node, name) {
+            if (!node) return null;
+            
+            const nodeName = node.name || node.id || '';
+            const normalizedNodeName = normalizeMDB(nodeName);
+            const normalizedName = normalizeMDB(name);
+            
+            if (nodeName === name || normalizedNodeName === name ||
+                nodeName === normalizedName || normalizedNodeName === normalizedName) {
+                return node;
+            }
+            
+            // Search in children
+            const children = node.children || node._children || [];
+            for (const child of children) {
+                const found = findNode(child, name);
+                if (found) return found;
+            }
+            
+            return null;
+        }
+        
+        // First try to find in MDB level
+        targetNode = treeData.children.find(child => {
+            const childName = child.name || child.id || '';
+            const normalizedChildName = normalizeMDB(childName);
+            return childName === boardName || normalizedChildName === boardName ||
+                   childName === normalizeMDB(boardName) || normalizedChildName === normalizeMDB(boardName);
+        });
+        
+        // If not found at MDB level, search recursively
+        if (!targetNode) {
+            for (const mdb of treeData.children) {
+                targetNode = findNode(mdb, boardName);
+                if (targetNode) break;
+            }
+        }
+    }
+    
+    if (!targetNode) {
+        logger.warn(`Board node not found for load calculation: ${boardName}`);
+        return 0;
+    }
+    
+    // Get children (check both children and _children for collapsed nodes)
+    const children = targetNode.children || targetNode._children || [];
+    
+    if (children.length === 0) {
+        return 0;
+    }
+    
+    let sum = 0;
+    
+    // Process children - for DBs, load detailed sheet to get NO OF UNITS
+    for (const child of children) {
+        // Get load from child node - check multiple possible locations
+        let childLoad = '0 kW';
+        
+        // Try different ways to get load value
+        if (child.load) {
+            childLoad = child.load;
+        } else if (child.data) {
+            if (child.data.Load) {
+                childLoad = child.data.Load;
+            } else if (child.data.LOAD) {
+                childLoad = child.data.LOAD;
+            } else if (child.data.load) {
+                childLoad = child.data.load;
+            } else if (child.data.data) {
+                childLoad = child.data.data.Load || child.data.data.LOAD || child.data.data.load || '0 kW';
+            }
+        }
+        
+        // Get number of units/items
+        let noOfUnits = 1; // Default to 1 if not found
+        
+        // Check child kind - if it's a DB or ESMDB, handle special cases
+        const childKind = (child.kind || child.data?.kind || child.data?.KIND || '').toString().toUpperCase();
+        const childName = child.name || child.id || '';
+        
+        // Check if this is a special DB (grouped with copy count)
+        const specialDBs = ['DB.TN.LXX.1B1.01', 'DB.TN.LXX.2B1.01', 'DB.TN.LXX.3B1.01', 'DB.TH.GF.01'];
+        const isSpecialDB = specialDBs.some(db => childName.includes(db));
+        
+        // Check if this is a special ESMDB (appears under multiple parents)
+        const specialESMDBs = ['ESMDB.LL.RF.01(LIFT)', 'ESMDB.LL.RF.02(LIFT)'];
+        const isSpecialESMDB = specialESMDBs.some(esmdb => childName.includes(esmdb));
+        
+        const isGroupNode = childName.includes('copies') || child.data?.isGroup || child.data?.copyCount;
+        
+        if (childKind === 'DB') {
+            // Special handling for grouped special DBs
+            if (isGroupNode || isSpecialDB) {
+                // Try to get copy count from group node data
+                if (child.data?.copyCount !== undefined && child.data?.copyCount !== null) {
+                    noOfUnits = parseFloat(child.data.copyCount) || 1;
+                } else {
+                    // Extract copy count from name like "DB.TN.LXX.1B1.01 (4 copies)"
+                    const match = childName.match(/\((\d+)\s*copies?\)/i);
+                    if (match) {
+                        noOfUnits = parseInt(match[1]) || 1;
+                    } else {
+                        // For special DBs, try to get copy count from parent SMDB/MDB
+                        // Find parent name from fedFromSMDB or parent node
+                        const parentName = child.data?.fedFromSMDB || 
+                                         (targetNode && targetNode.name ? targetNode.name : null);
+                        if (parentName && isSpecialDB) {
+                            const copyCounts = getDBCopyCounts(parentName);
+                            if (copyCounts) {
+                                // Extract base DB name (remove " (X copies)" if present)
+                                const baseDBName = childName.replace(/\s*\(\d+\s*copies?\)/i, '').trim();
+                                if (copyCounts[baseDBName]) {
+                                    noOfUnits = copyCounts[baseDBName];
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // For regular DBs (not grouped), extract NO OF UNITS from detailed sheet
+                const extractedUnits = await extractNoOfUnitsFromSheet(childName);
+                if (extractedUnits !== null && extractedUnits > 0) {
+                    noOfUnits = extractedUnits;
+                } else {
+                    // Fallback to data properties if sheet extraction fails
+                    if (child.data) {
+                        if (child.data['NO OF ITEMS'] !== undefined && child.data['NO OF ITEMS'] !== null && child.data['NO OF ITEMS'] !== '') {
+                            noOfUnits = parseFloat(child.data['NO OF ITEMS']) || 1;
+                        } else if (child.data['NO OF UNITS'] !== undefined && child.data['NO OF UNITS'] !== null && child.data['NO OF UNITS'] !== '') {
+                            noOfUnits = parseFloat(child.data['NO OF UNITS']) || 1;
+                        } else if (child.data.data) {
+                            if (child.data.data['NO OF ITEMS'] !== undefined && child.data.data['NO OF ITEMS'] !== null && child.data.data['NO OF ITEMS'] !== '') {
+                                noOfUnits = parseFloat(child.data.data['NO OF ITEMS']) || 1;
+                            } else if (child.data.data['NO OF UNITS'] !== undefined && child.data.data['NO OF UNITS'] !== null && child.data.data['NO OF UNITS'] !== '') {
+                                noOfUnits = parseFloat(child.data.data['NO OF UNITS']) || 1;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (childKind === 'ESMDB' && (isGroupNode || isSpecialESMDB)) {
+            // Special handling for grouped special ESMDBs
+            // Try to get copy count from group node data
+            if (child.data?.copyCount !== undefined && child.data?.copyCount !== null) {
+                noOfUnits = parseFloat(child.data.copyCount) || 1;
+            } else {
+                // Extract copy count from name like "ESMDB.LL.RF.01(LIFT) (1 copies)"
+                const match = childName.match(/\((\d+)\s*copies?\)/i);
+                if (match) {
+                    noOfUnits = parseInt(match[1]) || 1;
+                } else {
+                    // For special ESMDBs, try to get copy count from parent
+                    const parentName = child.data?.fedFromParent || 
+                                     (targetNode && targetNode.name ? targetNode.name : null);
+                    if (parentName && isSpecialESMDB) {
+                        const copyCounts = getESMDBCopyCounts(parentName);
+                        if (copyCounts) {
+                            // Extract base ESMDB name (remove " (X copies)" if present)
+                            const baseESMDBName = childName.replace(/\s*\(\d+\s*copies?\)/i, '').trim();
+                            if (copyCounts[baseESMDBName]) {
+                                noOfUnits = copyCounts[baseESMDBName];
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // For non-DB/non-special-ESMDB children, use data properties
+            if (child.data) {
+                if (child.data['NO OF ITEMS'] !== undefined && child.data['NO OF ITEMS'] !== null && child.data['NO OF ITEMS'] !== '') {
+                    noOfUnits = parseFloat(child.data['NO OF ITEMS']) || 1;
+                } else if (child.data['NO OF UNITS'] !== undefined && child.data['NO OF UNITS'] !== null && child.data['NO OF UNITS'] !== '') {
+                    noOfUnits = parseFloat(child.data['NO OF UNITS']) || 1;
+                } else if (child.data.data) {
+                    if (child.data.data['NO OF ITEMS'] !== undefined && child.data.data['NO OF ITEMS'] !== null && child.data.data['NO OF ITEMS'] !== '') {
+                        noOfUnits = parseFloat(child.data.data['NO OF ITEMS']) || 1;
+                    } else if (child.data.data['NO OF UNITS'] !== undefined && child.data.data['NO OF UNITS'] !== null && child.data.data['NO OF UNITS'] !== '') {
+                        noOfUnits = parseFloat(child.data.data['NO OF UNITS']) || 1;
+                    }
+                }
+            }
+        }
+        
+        const loadValue = parseLoadValue(childLoad);
+        // Multiply load by number of units
+        const effectiveLoad = loadValue * noOfUnits;
+        sum += effectiveLoad;
+        
+        // Debug log
+        logger.log(`  Child ${childName} (${childKind}): Load=${loadValue.toFixed(2)} kW × Units=${noOfUnits} = ${effectiveLoad.toFixed(2)} kW`);
+    }
+    
+    logger.log(`✓ Calculated children load sum for ${boardName}: ${sum.toFixed(2)} kW (load × units)`);
+    return sum;
+}
+
+// Store last modified time for change detection
+let lastModifiedTime = null;
+let pollingInterval = null;
+const POLL_INTERVAL = 60000; // Check every 60 seconds (reduced frequency for better performance)
+
+// Load data dynamically from Excel file
+function loadData(showLoading = true, silent = false) {
+    // Show loading indicator only on initial load
+    if (showLoading && !silent) {
+        const mindmapContainer = document.getElementById('mindmap');
+        if (mindmapContainer) {
+            mindmapContainer.innerHTML = `<div style="padding: 40px; text-align: center; color: #666;"><div style="font-size: 18px; margin-bottom: 10px;">Loading data from Excel...</div><div style="font-size: 14px; color: #999;">Syncing with ${EXCEL_FILE_NAME}</div></div>`;
+        }
+    }
+    
+    // Fetch Excel file (cache: 'no-store' prevents browser caching)
+    fetch(EXCEL_FILE_NAME, { cache: 'no-store' })
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`Failed to fetch Excel file: ${response.status} ${response.statusText}`);
+            }
+            
+            // Check if file has changed using headers
+            const currentModified = response.headers.get('Last-Modified');
+            const etag = response.headers.get('ETag');
+            const checkValue = currentModified || etag;
+            
+            if (silent) {
+                logger.log('Silent check - Last-Modified:', currentModified, 'ETag:', etag, 'Stored:', lastModifiedTime);
+            }
+            
+            // For silent checks, skip if file hasn't changed
+            if (silent && lastModifiedTime && checkValue && checkValue === lastModifiedTime) {
+                logger.log('✓ Excel file unchanged, skipping reload');
+                return null; // Signal no change
+            }
+            
+            // Update last modified time
+            if (checkValue) {
+                const wasUpdate = lastModifiedTime !== checkValue;
+                lastModifiedTime = checkValue;
+                if (wasUpdate && silent) {
+                    logger.log('✓ File changed detected, reloading data...');
+                }
+            } else if (silent) {
+                logger.warn('⚠ No Last-Modified or ETag header available, will reload anyway');
+            }
+            
+            return response.arrayBuffer();
+        })
+        .then(data => {
+            if (!data) return; // No change detected, skip processing
+            processExcelData(data, silent);
+        })
+        .catch(error => {
+            console.error('Error loading Excel file:', error);
+            if (!silent) {
+                const mindmapContainer = document.getElementById('mindmap');
+                if (mindmapContainer) {
+                    mindmapContainer.innerHTML = 
+                        '<div style="padding: 40px; text-align: center; color: #d32f2f;">' +
+                        '<div style="font-size: 18px; margin-bottom: 10px;">Error loading data</div>' +
+                        '<div style="font-size: 14px; color: #666; margin-bottom: 20px;">' + error.message + '</div>' +
+                        '<button onclick="loadData()" style="padding: 10px 20px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer;">Retry</button>' +
+                        '</div>';
+                }
+            }
+        });
+}
+
+// Process Excel data
+function processExcelData(data, silent = false) {
+    if (!data) return;
+    
+    // Parse Excel file
+    const workbook = XLSX.read(data, { type: 'array' });
+    
+    // Read TOTALLIST sheet
+    if (!workbook.SheetNames.includes('TOTALLIST')) {
+        throw new Error('TOTALLIST sheet not found in Excel file');
+    }
+    
+    const worksheet = workbook.Sheets['TOTALLIST'];
+    
+    // Helper function to resolve Excel formulas by reading referenced cells (with caching)
+    function resolveFormula(formula, workbook) {
+        if (!formula || typeof formula !== 'string' || !formula.startsWith('=')) {
+            return formula; // Not a formula, return as-is
+        }
+        
+        // Check cache first
+        if (formulaCache.has(formula)) {
+            return formulaCache.get(formula);
+        }
+        
+        // Parse formula like ='SheetName'!F163 or =SheetName!F163
+        // Handle both quoted and unquoted sheet names
+        let sheetName, col, row;
+        
+        // Try pattern with quotes: ='Sheet Name'!F163
+        const quotedMatch = formula.match(/^='([^']+)'!([A-Z]+)(\d+)$/);
+        if (quotedMatch) {
+            sheetName = quotedMatch[1];
+            col = quotedMatch[2];
+            row = parseInt(quotedMatch[3]);
+        } else {
+            // Try pattern without quotes: =SheetName!F163
+            const unquotedMatch = formula.match(/^=([^!]+)!([A-Z]+)(\d+)$/);
+            if (unquotedMatch) {
+                sheetName = unquotedMatch[1];
+                col = unquotedMatch[2];
+                row = parseInt(unquotedMatch[3]);
+            } else {
+                logger.warn(`Could not parse formula: ${formula}`);
+                formulaCache.set(formula, 0);
+                return 0;
+            }
+        }
+        
+        try {
+            // Find matching sheet (handle normalization: MDB -> MDB1, MDB.GF.04 -> MDB4)
+            let targetSheetName = sheetName;
+            if (sheetName === 'MDB') {
+                targetSheetName = 'MDB1';
+            } else if (sheetName === 'MDB.GF.04' || sheetName === 'MDB GF 04') {
+                targetSheetName = 'MDB4';
+            }
+            
+            if (workbook.SheetNames.includes(targetSheetName)) {
+                const refSheet = workbook.Sheets[targetSheetName];
+                // Convert column letter to index (F = 5, A = 0)
+                const colIndex = XLSX.utils.decode_col(col);
+                // Convert row number to index (163 -> 162, since it's 0-based)
+                const rowIndex = row - 1;
+                const cellAddress = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+                const cell = refSheet[cellAddress];
+                
+                if (cell) {
+                    // Return the value (v property contains the calculated value)
+                    const value = cell.v;
+                    if (value !== undefined && value !== null && value !== '') {
+                        const result = typeof value === 'number' ? value : parseFloat(value) || 0;
+                        formulaCache.set(formula, result);
+                        return result;
+                    }
+                }
+            } else {
+                // Try to find sheet with similar name
+                const matchingSheet = workbook.SheetNames.find(name => 
+                    name.toUpperCase() === targetSheetName.toUpperCase() ||
+                    name.toUpperCase() === sheetName.toUpperCase()
+                );
+                if (matchingSheet) {
+                    const refSheet = workbook.Sheets[matchingSheet];
+                    const colIndex = XLSX.utils.decode_col(col);
+                    const rowIndex = row - 1;
+                    const cellAddress = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+                    const cell = refSheet[cellAddress];
+                    if (cell && cell.v !== undefined && cell.v !== null && cell.v !== '') {
+                        const result = typeof cell.v === 'number' ? cell.v : parseFloat(cell.v) || 0;
+                        formulaCache.set(formula, result);
+                        return result;
+                    }
+                } else {
+                    logger.warn(`Sheet "${targetSheetName}" (from formula ${formula}) not found.`);
+                }
+            }
+        } catch (e) {
+            logger.warn(`Error resolving formula ${formula}:`, e);
+        }
+        
+        // Cache the result (0) to avoid repeated failures
+        formulaCache.set(formula, 0);
+        return 0; // Return 0 if formula can't be resolved
+    }
+    
+    // First, find the Estimate column index and header row
+    let estimateColIndex = -1;
+    let headerRowIndex = 0;
+    const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
+    
+    // Find header row and Estimate column
+    for (let row = 0; row <= Math.min(10, range.e.r); row++) {
+        for (let col = 0; col <= range.e.c; col++) {
+            const cellAddress = XLSX.utils.encode_cell({ r: row, c: col });
+            const cell = worksheet[cellAddress];
+            if (cell && cell.v) {
+                const cellValue = String(cell.v).toLowerCase().trim();
+                if (cellValue === 'estimate') {
+                    estimateColIndex = col;
+                    headerRowIndex = row;
+                    break;
+                }
+            }
+        }
+        if (estimateColIndex !== -1) break;
+    }
+    
+    // Convert sheet to JSON array
+    // Use raw: true to preserve numeric types (consistent with data.js format)
+    const jsonData = XLSX.utils.sheet_to_json(worksheet, { 
+        defval: '', // Default value for empty cells
+        raw: true  // Preserve numeric types for calculations
+    });
+    
+    // Convert to array of objects (same format as data.js)
+    const processedData = jsonData.map((row, rowIndex) => {
+        const processedRow = {};
+        for (const [key, value] of Object.entries(row)) {
+            // Handle NaN and null values
+            if (value === null || value === undefined || value === '') {
+                processedRow[key] = '';
+            } else if (typeof value === 'number' && isNaN(value)) {
+                processedRow[key] = '';
+            } else {
+                // Preserve the value as-is (numbers stay numbers, strings stay strings)
+                let processedValue = value;
+                
+                // Check if this is the Estimate column and if the cell contains a formula
+                if (key === 'Estimate' || key === 'ESTIMATE') {
+                    // Read the cell directly to check for formulas
+                    if (estimateColIndex !== -1) {
+                        // Calculate Excel row: headerRowIndex + 1 (for header) + rowIndex (data row)
+                        const excelRowIndex = headerRowIndex + 1 + rowIndex;
+                        const cellAddress = XLSX.utils.encode_cell({ r: excelRowIndex, c: estimateColIndex });
+                        const cell = worksheet[cellAddress];
+                        
+                        if (cell) {
+                            // Check if cell has a formula (f property)
+                            if (cell.f) {
+                                // Cell contains a formula - resolve it
+                                processedValue = resolveFormula(cell.f, workbook);
+                            } else if (cell.v !== undefined && cell.v !== null && cell.v !== '') {
+                                // Cell has a calculated value (Excel already calculated it)
+                                processedValue = typeof cell.v === 'number' ? cell.v : parseFloat(cell.v) || 0;
+                            } else if (typeof processedValue === 'string' && processedValue.startsWith('=')) {
+                                // Value is a formula string - resolve it
+                                processedValue = resolveFormula(processedValue, workbook);
+                            }
+                        } else {
+                            // Cell not found - might be empty or out of range
+                            // Keep the value from sheet_to_json
+                        }
+                    } else if (typeof processedValue === 'string' && processedValue.startsWith('=')) {
+                        // Fallback: if value is a formula string, resolve it
+                        processedValue = resolveFormula(processedValue, workbook);
+                    }
+                } else {
+                    // Check if this is a formula (starts with =) and resolve it
+                    if (typeof processedValue === 'string' && processedValue.startsWith('=')) {
+                        // This is likely a formula - try to resolve it
+                        processedValue = resolveFormula(processedValue, workbook);
+                    }
+                }
+                
+                // Fix SMDB.LL.04.01 -> SMDB.LL.L04.01 (correct missing L in level number)
+                if (typeof processedValue === 'string' && (key === 'Itemdrop' || key === 'MDB')) {
+                    // Fix pattern: SMDB.LL.##.01 -> SMDB.LL.L##.01
+                    processedValue = processedValue.replace(/^SMDB\.LL\.(\d{2})\.01$/i, 'SMDB.LL.L$1.01');
+                }
+                
+                processedRow[key] = processedValue;
+            }
+        }
+        return processedRow;
+    });
+    
+    const wasInitialLoad = !window.allData;
+    const dataChanged = wasInitialLoad || JSON.stringify(window.allData) !== JSON.stringify(processedData);
+    
+    logger.log('Data loaded from Excel:', processedData.length, 'items');
+    
+    // Verify ESTIMATE and LOAD columns are present
+    if (processedData.length > 0) {
+        const firstItem = processedData[0];
+        const hasEstimateColumn = 'Estimate' in firstItem || 'ESTIMATE' in firstItem;
+        const hasLoadColumn = 'Load' in firstItem || 'LOAD' in firstItem;
+        logger.log('✓ ESTIMATE column present:', hasEstimateColumn);
+        logger.log('✓ LOAD column present:', hasLoadColumn);
+        if (hasEstimateColumn) {
+            const estimateKey = 'Estimate' in firstItem ? 'Estimate' : 'ESTIMATE';
+            logger.log('✓ ESTIMATE column key:', estimateKey);
+            // Sample a few items to verify estimates
+            const sampleItems = processedData.slice(0, 5).filter(item => item[estimateKey]);
+            logger.log('✓ Sample ESTIMATE values:', sampleItems.map(item => ({
+                name: item.Itemdrop || item.MDB,
+                estimate: item[estimateKey]
+            })));
+        }
+        if (hasLoadColumn) {
+            const loadKey = 'Load' in firstItem ? 'Load' : 'LOAD';
+            logger.log('✓ LOAD column key:', loadKey);
+            // Sample a few items to verify loads
+            const sampleItems = processedData.slice(0, 5).filter(item => item[loadKey]);
+            logger.log('✓ Sample LOAD values:', sampleItems.map(item => ({
+                name: item.Itemdrop || item.MDB,
+                load: item[loadKey]
+            })));
+        }
+    }
+    
+    window.allData = processedData;
+    
+    // Process and display data (use requestAnimationFrame for smooth updates)
+    requestAnimationFrame(() => {
+        processData();
+        requestAnimationFrame(() => {
+            initializeDiagram();
+            updateStats();
+            populateFilters();
+        });
+    });
+    
+    // Show notification if data was updated (not initial load)
+    if (!wasInitialLoad && dataChanged && !silent) {
+        showSyncNotification('Data synchronized with Excel file');
+    }
+}
+
+// Show sync notification
+function showSyncNotification(message) {
+    // Remove existing notification if any
+    const existingNotification = document.getElementById('sync-notification');
+    if (existingNotification) {
+        existingNotification.remove();
+    }
+    
+    // Create notification element
+    const notification = document.createElement('div');
+    notification.id = 'sync-notification';
+    notification.textContent = message;
+    notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: #4CAF50;
+        color: white;
+        padding: 12px 20px;
+        border-radius: 5px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        z-index: 10000;
+        font-size: 14px;
+        animation: slideIn 0.3s ease-out;
+    `;
+    
+    document.body.appendChild(notification);
+    
+    // Remove after 3 seconds
+    setTimeout(() => {
+        notification.style.animation = 'slideOut 0.3s ease-out';
+        setTimeout(() => {
+            if (notification.parentNode) {
+                notification.remove();
+            }
+        }, 300);
+    }, 3000);
+}
+
+// Start automatic polling for Excel file changes
+function startAutoSync() {
+    // Clear any existing interval
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
+        logger.log('Cleared existing auto-sync interval');
+    }
+    
+    // Poll every POLL_INTERVAL milliseconds
+    pollingInterval = setInterval(() => {
+        logger.log(`Auto-sync: Checking ${EXCEL_FILE_NAME} for changes...`);
+        loadData(false, true); // Silent check (no loading indicator)
+    }, POLL_INTERVAL);
+    
+    logger.log(`✓ Auto-sync started: Monitoring ${EXCEL_FILE_NAME} for changes every ${POLL_INTERVAL / 1000} seconds`);
+    logger.log(`✓ Next check will be in ${POLL_INTERVAL / 1000} seconds`);
+    
+    // Update sync status indicator
+    updateSyncStatus(true);
+}
+
+// Stop automatic polling
+function stopAutoSync() {
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
+        pollingInterval = null;
+        logger.log('Auto-sync stopped');
+        updateSyncStatus(false);
+    }
+}
+
+// Update sync status indicator
+function updateSyncStatus(isActive) {
+    const syncIndicator = document.getElementById('sync-indicator');
+    const syncText = document.getElementById('sync-text');
+    
+    if (syncIndicator && syncText) {
+        if (isActive) {
+            syncIndicator.textContent = '●';
+            syncIndicator.style.color = '#4CAF50';
+            syncIndicator.style.animation = 'pulse 2s infinite';
+            syncText.textContent = `Syncing with ${EXCEL_FILE_NAME} (every ${POLL_INTERVAL / 1000}s)`;
+            syncText.style.color = '#4CAF50';
+        } else {
+            syncIndicator.textContent = '●';
+            syncIndicator.style.color = '#999';
+            syncIndicator.style.animation = 'none';
+            syncText.textContent = 'Sync stopped';
+            syncText.style.color = '#999';
+        }
+    }
+}
+
+// Helper function to get DB copy counts for special SMDBs/MDBs
+function getDBCopyCounts(parentName) {
+    const normalized = parentName.replace(/\.01$/, '');
     
     // Special case for SMDB.TN.P2
     if (normalized === 'SMDB.TN.P2') {
@@ -186,6 +930,20 @@ function getDBCopyCounts(smdbName) {
             'DB.TN.LXX.1B1.01': 3,
             'DB.TN.LXX.2B1.01': 1,
             'DB.TN.LXX.3B1.01': 1
+        };
+    }
+    
+    // Special case for DB.TH.GF.01 - appears under SMDB.TH.B1.01 and MDB4
+    if (normalized === 'SMDB.TH.B1' || parentName === 'SMDB.TH.B1.01') {
+        return {
+            'DB.TH.GF.01': 1
+        };
+    }
+    
+    // Handle MDB4 (MDB.GF.04) as parent for DB.TH.GF.01
+    if (normalized === 'MDB.GF.04' || normalized === 'MDB4' || parentName === 'MDB4' || parentName === 'MDB.GF.04') {
+        return {
+            'DB.TH.GF.01': 1
         };
     }
     
@@ -223,6 +981,26 @@ function getDBCopyCounts(smdbName) {
     return null;
 }
 
+// Helper function to get ESMDB copy counts for special ESMDBs
+// ESMDB.LL.RF.01(LIFT) and ESMDB.LL.RF.02(LIFT) appear under both BB.05 and EMDB.GF.01
+function getESMDBCopyCounts(parentName) {
+    const normalized = parentName.replace(/\.01$/, '');
+    
+    // Special ESMDBs that appear under multiple parents
+    const specialESMDBs = ['ESMDB.LL.RF.01(LIFT)', 'ESMDB.LL.RF.02(LIFT)'];
+    
+    // Check if parent is BB.05 or EMDB.GF.01
+    if (normalized === 'BB.05' || parentName === 'BB.05' || 
+        normalized === 'EMDB.GF' || parentName === 'EMDB.GF.01') {
+        return {
+            'ESMDB.LL.RF.01(LIFT)': 1,
+            'ESMDB.LL.RF.02(LIFT)': 1
+        };
+    }
+    
+    return null;
+}
+
 function processData() {
     const allData = window.allData || (typeof allData !== 'undefined' ? allData : []);
     if (!allData || allData.length === 0) {
@@ -245,16 +1023,63 @@ function processData() {
     
     mdbList.forEach(mdbName => {
         // Find corresponding data item for this MDB
-        const mdbData = allData.find(d => (d.Itemdrop || d.MDB) === mdbName);
+        // For MDB4, also check for MDB.GF.04
+        let mdbData = allData.find(d => {
+            const itemdrop = d.Itemdrop || '';
+            const mdb = d.MDB || '';
+            return itemdrop === mdbName || mdb === mdbName || 
+                   (mdbName === 'MDB4' && (itemdrop === 'MDB.GF.04' || mdb === 'MDB.GF.04'));
+        });
+        
+        // If not found, try to find by sheet name pattern (MDB1 sheet for MDB1, etc.)
+        if (!mdbData && mdbName === 'MDB1') {
+            // Also check for sheets named "MDB" (without number)
+            mdbData = allData.find(d => {
+                const itemdrop = (d.Itemdrop || '').toString().trim();
+                const mdb = (d.MDB || '').toString().trim();
+                return (itemdrop === 'MDB' || mdb === 'MDB') && 
+                       (d.KIND || '').toString().toUpperCase() === 'MDB';
+            });
+        }
+        
+        // Ensure mdbData has all required fields, even if empty
+        // Get load from LOAD column (try both cases for column name)
+        const mdbLoad = mdbData ? ((mdbData.Load !== undefined && mdbData.Load !== null && mdbData.Load !== '') 
+            ? mdbData.Load 
+            : ((mdbData.LOAD !== undefined && mdbData.LOAD !== null && mdbData.LOAD !== '') ? mdbData.LOAD : '0 kW')) : '0 kW';
+        
+        // Normalize Itemdrop and MDB to remove "MDB" from MDB1 and "MDB.GF.04" from MDB4
+        const normalizedItemdrop = mdbData ? (normalizeMDB(mdbData.Itemdrop) || mdbName) : mdbName;
+        const normalizedMDB = mdbData ? (normalizeMDB(mdbData.MDB) || mdbName) : mdbName;
+        
+        const completeMdbData = mdbData ? {
+            ...mdbData, // Spread to include any other fields first
+            // Override Itemdrop and MDB with normalized values (removes "MDB" from MDB1, "MDB.GF.04" from MDB4)
+            Itemdrop: normalizedItemdrop,
+            MDB: normalizedMDB,
+            KIND: mdbData.KIND || 'MDB',
+            Load: mdbLoad,
+            Estimate: mdbData.Estimate || 0,
+            'NO OF ITEMS': mdbData['NO OF ITEMS'] || 0,
+            'FED FROM': mdbData['FED FROM'] || 'RMU'
+        } : {
+            Itemdrop: mdbName,
+            MDB: mdbName,
+            KIND: 'MDB',
+            Load: '0 kW',
+            Estimate: 0,
+            'NO OF ITEMS': 0,
+            'FED FROM': 'RMU'
+        };
         
         const mdbNode = {
             name: mdbName,
             id: mdbName,
             kind: 'MDB',
-            load: mdbData ? (mdbData.Load || '0 kW') : '0 kW',
-            estimate: mdbData ? (mdbData.Estimate || 0) : 0,
+            load: mdbLoad,
+            estimate: parseFloat(completeMdbData.Estimate) || 0,
             mdb: mdbName,
-            data: mdbData || null, // Attach data so it's clickable
+            data: completeMdbData, // Use complete data with all fields
             children: []
         };
         rmuNode.children.push(mdbNode);
@@ -262,7 +1087,7 @@ function processData() {
     });
     
     // Process all items - build complete tree structure
-    const specialDBs = ['DB.TN.LXX.1B1.01', 'DB.TN.LXX.2B1.01', 'DB.TN.LXX.3B1.01'];
+    const specialDBs = ['DB.TN.LXX.1B1.01', 'DB.TN.LXX.2B1.01', 'DB.TN.LXX.3B1.01', 'DB.TH.GF.01'];
     const itemMap = new Map();
     const processedItems = new Set();
     
@@ -278,8 +1103,14 @@ function processData() {
         if (!itemName || itemName === 'RMU' || specialDBs.includes(itemName)) return;
         
         const kind = item.KIND || 'Unknown';
-        const load = item.Load || '0 kW';
-        const estimate = item.Estimate || 0;
+        // Get load from LOAD column (try both cases for column name)
+        const load = (item.Load !== undefined && item.Load !== null && item.Load !== '') 
+            ? item.Load 
+            : ((item.LOAD !== undefined && item.LOAD !== null && item.LOAD !== '') ? item.LOAD : '0 kW');
+        // Get estimate from ESTIMATE column (try both cases for column name)
+        const estimate = (item.Estimate !== undefined && item.Estimate !== null && item.Estimate !== '') 
+            ? item.Estimate 
+            : ((item.ESTIMATE !== undefined && item.ESTIMATE !== null && item.ESTIMATE !== '') ? item.ESTIMATE : 0);
         const mdb = item.MDB || '';
         
         const nodeData = {
@@ -288,7 +1119,7 @@ function processData() {
             kind: kind,
             load: load,
             estimate: estimate,
-            mdb: mdb,
+            mdb: normalizeMDB(mdb),
             data: item,
             children: []
         };
@@ -391,37 +1222,66 @@ function processData() {
         
         const fedFrom = item['FED FROM'] || '';
         const kind = item.KIND || 'Unknown';
-        const load = item.Load || '0 kW';
-        const estimate = item.Estimate || 0;
+        // Get load from LOAD column (try both cases for column name)
+        const load = (item.Load !== undefined && item.Load !== null && item.Load !== '') 
+            ? item.Load 
+            : ((item.LOAD !== undefined && item.LOAD !== null && item.LOAD !== '') ? item.LOAD : '0 kW');
+        // Get estimate from ESTIMATE column (try both cases for column name)
+        const estimate = (item.Estimate !== undefined && item.Estimate !== null && item.Estimate !== '') 
+            ? item.Estimate 
+            : ((item.ESTIMATE !== undefined && item.ESTIMATE !== null && item.ESTIMATE !== '') ? item.ESTIMATE : 0);
         const mdb = item.MDB || '';
         
-        const smdbList = fedFrom.split('\n').map(p => p.trim()).filter(p => p && p !== 'RMU');
+        const parentList = fedFrom.split('\n').map(p => p.trim()).filter(p => p && p !== 'RMU');
         
-        smdbList.forEach(smdbName => {
-            const copyCounts = getDBCopyCounts(smdbName);
+        parentList.forEach(parentName => {
+            const copyCounts = getDBCopyCounts(parentName);
             if (copyCounts && copyCounts[itemName]) {
                 const count = copyCounts[itemName];
                 
-                // Find or create SMDB node
-                let smdbNode = itemMap.get(smdbName);
-                if (!smdbNode) {
-                    smdbNode = {
-                        name: smdbName,
-                        id: smdbName,
-                        kind: 'SMDB',
-                        children: []
-                    };
-                    itemMap.set(smdbName, smdbNode);
-                    
-                    // Connect SMDB to its parent (find from data)
-                    const smdbItem = allDataArray.find(d => (d.Itemdrop || d.MDB) === smdbName);
-                    if (smdbItem) {
-                        const smdbFedFrom = smdbItem['FED FROM'] || '';
-                        if (smdbFedFrom.includes('MDB')) {
-                            const mdbMatch = smdbFedFrom.match(/MDB\d/);
-                            if (mdbMatch && mdbNodes[mdbMatch[0]]) {
-                                if (!mdbNodes[mdbMatch[0]].children.find(c => c.id === smdbName)) {
-                                    mdbNodes[mdbMatch[0]].children.push(smdbNode);
+                // Check if parent is MDB4 or an SMDB
+                const isMDB4 = parentName === 'MDB4' || parentName === 'MDB.GF.04' || parentName === 'MDB GF 04';
+                
+                // Find or create parent node (SMDB or MDB4)
+                let parentNode = itemMap.get(parentName);
+                if (!parentNode) {
+                    if (isMDB4) {
+                        // For MDB4, use the existing MDB node
+                        const mdb4Name = 'MDB4';
+                        parentNode = mdbNodes[mdb4Name];
+                        if (!parentNode) {
+                            // Create MDB4 node if it doesn't exist
+                            parentNode = {
+                                name: mdb4Name,
+                                id: mdb4Name,
+                                kind: 'MDB',
+                                children: []
+                            };
+                            mdbNodes[mdb4Name] = parentNode;
+                            if (rmuNode && !rmuNode.children.find(c => c.id === mdb4Name)) {
+                                rmuNode.children.push(parentNode);
+                            }
+                        }
+                    } else {
+                        // For SMDB, create new node
+                        parentNode = {
+                            name: parentName,
+                            id: parentName,
+                            kind: 'SMDB',
+                            children: []
+                        };
+                        itemMap.set(parentName, parentNode);
+                        
+                        // Connect SMDB to its parent (find from data)
+                        const smdbItem = allDataArray.find(d => (d.Itemdrop || d.MDB) === parentName);
+                        if (smdbItem) {
+                            const smdbFedFrom = smdbItem['FED FROM'] || '';
+                            if (smdbFedFrom.includes('MDB')) {
+                                const mdbMatch = smdbFedFrom.match(/MDB\d/);
+                                if (mdbMatch && mdbNodes[mdbMatch[0]]) {
+                                    if (!mdbNodes[mdbMatch[0]].children.find(c => c.id === parentName)) {
+                                        mdbNodes[mdbMatch[0]].children.push(parentNode);
+                                    }
                                 }
                             }
                         }
@@ -431,49 +1291,75 @@ function processData() {
                 // Create group node
                 const groupNode = {
                     name: `${itemName} (${count} copies)`,
-                    id: `${smdbName}_${itemName}_group`,
+                    id: `${parentName}_${itemName}_group`,
                     kind: kind,
                     load: load,
                     estimate: estimate,
-                    mdb: mdb,
-                    data: { ...item, copyCount: count, fedFromSMDB: smdbName, isGroup: true },
+                    mdb: normalizeMDB(mdb),
+                    data: { ...item, copyCount: count, fedFromSMDB: parentName, isGroup: true },
                     groupCount: count,
                     collapsed: true,
                     children: []
                 };
                 
-                smdbNode.children.push(groupNode);
+                parentNode.children.push(groupNode);
             }
         });
     });
     
-    // Second, process SMDBs that have special copy counts but may not be in FED FROM
-    // This handles cases like SMDB.TN.P2.01
+    // Second, process SMDBs/MDBs that have special copy counts but may not be in FED FROM
+    // This handles cases like SMDB.TN.P2.01, SMDB.TH.B1.01, and MDB4 with DB.TH.GF.01
     allDataArray.forEach(item => {
         const itemName = item.Itemdrop || item.MDB || '';
-        if (!itemName.startsWith('SMDB.TN.')) return;
+        
+        // Check if this is SMDB.TN.*, SMDB.TH.*, or MDB4/MDB.GF.04
+        const isSMDBTN = itemName.startsWith('SMDB.TN.');
+        const isSMDBTH = itemName.startsWith('SMDB.TH.');
+        const isMDB4 = itemName === 'MDB4' || itemName === 'MDB.GF.04' || itemName === 'MDB GF 04';
+        
+        if (!isSMDBTN && !isSMDBTH && !isMDB4) return;
         
         const copyCounts = getDBCopyCounts(itemName);
         if (!copyCounts) return;
         
-        // Find or create SMDB node
-        let smdbNode = itemMap.get(itemName);
-        if (!smdbNode) {
-            smdbNode = {
-                name: itemName,
-                id: itemName,
-                kind: 'SMDB',
-                children: []
-            };
-            itemMap.set(itemName, smdbNode);
-            
-            // Connect SMDB to its parent (find from data)
-            const smdbFedFrom = item['FED FROM'] || '';
-            if (smdbFedFrom.includes('MDB')) {
-                const mdbMatch = smdbFedFrom.match(/MDB\d/);
-                if (mdbMatch && mdbNodes[mdbMatch[0]]) {
-                    if (!mdbNodes[mdbMatch[0]].children.find(c => c.id === itemName)) {
-                        mdbNodes[mdbMatch[0]].children.push(smdbNode);
+        // Find or create SMDB/MDB node
+        let parentNode = itemMap.get(itemName);
+        if (!parentNode) {
+            if (isMDB4) {
+                // For MDB4, use the existing MDB node
+                const mdb4Name = 'MDB4';
+                parentNode = mdbNodes[mdb4Name];
+                if (!parentNode) {
+                    // Create MDB4 node if it doesn't exist
+                    parentNode = {
+                        name: mdb4Name,
+                        id: mdb4Name,
+                        kind: 'MDB',
+                        children: []
+                    };
+                    mdbNodes[mdb4Name] = parentNode;
+                    if (rmuNode && !rmuNode.children.find(c => c.id === mdb4Name)) {
+                        rmuNode.children.push(parentNode);
+                    }
+                }
+            } else {
+                // For SMDB, create new node
+                parentNode = {
+                    name: itemName,
+                    id: itemName,
+                    kind: 'SMDB',
+                    children: []
+                };
+                itemMap.set(itemName, parentNode);
+                
+                // Connect SMDB to its parent (find from data)
+                const smdbFedFrom = item['FED FROM'] || '';
+                if (smdbFedFrom.includes('MDB')) {
+                    const mdbMatch = smdbFedFrom.match(/MDB\d/);
+                    if (mdbMatch && mdbNodes[mdbMatch[0]]) {
+                        if (!mdbNodes[mdbMatch[0]].children.find(c => c.id === itemName)) {
+                            mdbNodes[mdbMatch[0]].children.push(parentNode);
+                        }
                     }
                 }
             }
@@ -486,12 +1372,15 @@ function processData() {
                 
                 // Check if group node already exists
                 const groupId = `${itemName}_${dbType}_group`;
-                if (smdbNode.children.find(c => c.id === groupId)) return;
+                if (parentNode.children.find(c => c.id === groupId)) return;
                 
                 // Find the DB item data
                 const dbItem = allDataArray.find(d => (d.Itemdrop || d.MDB) === dbType);
                 const kind = dbItem ? (dbItem.KIND || 'Unknown') : 'DB';
-                const load = dbItem ? (dbItem.Load || '0 kW') : '0 kW';
+                // Get load from LOAD column (try both cases for column name)
+                const load = dbItem ? ((dbItem.Load !== undefined && dbItem.Load !== null && dbItem.Load !== '') 
+                    ? dbItem.Load 
+                    : ((dbItem.LOAD !== undefined && dbItem.LOAD !== null && dbItem.LOAD !== '') ? dbItem.LOAD : '0 kW')) : '0 kW';
                 const estimate = dbItem ? (dbItem.Estimate || 0) : 0;
                 const mdb = dbItem ? (dbItem.MDB || '') : '';
                 
@@ -502,17 +1391,150 @@ function processData() {
                     kind: kind,
                     load: load,
                     estimate: estimate,
-                    mdb: mdb,
+                    mdb: normalizeMDB(mdb),
                     data: dbItem ? { ...dbItem, copyCount: count, fedFromSMDB: itemName, isGroup: true } : { copyCount: count, fedFromSMDB: itemName, isGroup: true },
                     groupCount: count,
                     collapsed: true,
                     children: []
                 };
                 
-                smdbNode.children.push(groupNode);
+                parentNode.children.push(groupNode);
             }
         });
     });
+    
+    // Third, process special ESMDBs that appear under multiple parents (BB.05 and EMDB.GF.01)
+    const specialESMDBs = ['ESMDB.LL.RF.01(LIFT)', 'ESMDB.LL.RF.02(LIFT)'];
+    const esmdbParents = ['BB.05', 'EMDB.GF.01'];
+    
+    esmdbParents.forEach(parentName => {
+        const copyCounts = getESMDBCopyCounts(parentName);
+        if (!copyCounts) return;
+        
+        // Find or create parent node (BB.05 or EMDB.GF.01)
+        let parentNode = itemMap.get(parentName);
+        
+        // Try to find parent in existing tree structure
+        if (!parentNode) {
+            // Search for BB.05 or EMDB.GF.01 in the tree
+            function findParentInTree(node, name) {
+                if (!node) return null;
+                if (node.name === name || node.id === name) return node;
+                
+                const children = node.children || [];
+                for (const child of children) {
+                    const found = findParentInTree(child, name);
+                    if (found) return found;
+                }
+                return null;
+            }
+            
+            // Search from RMU node
+            if (rmuNode) {
+                parentNode = findParentInTree(rmuNode, parentName);
+            }
+            
+            // If still not found, try to find from allDataArray
+            if (!parentNode) {
+                const parentItem = allDataArray.find(d => (d.Itemdrop || d.MDB) === parentName);
+                if (parentItem) {
+                    const kind = parentItem.KIND || 'BUS BAR RAISER';
+                    parentNode = {
+                        name: parentName,
+                        id: parentName,
+                        kind: kind,
+                        children: []
+                    };
+                    itemMap.set(parentName, parentNode);
+                    
+                    // Try to connect to its parent (MDB)
+                    const parentFedFrom = parentItem['FED FROM'] || '';
+                    if (parentFedFrom.includes('MDB')) {
+                        const mdbMatch = parentFedFrom.match(/MDB\d/);
+                        if (mdbMatch && mdbNodes[mdbMatch[0]]) {
+                            if (!mdbNodes[mdbMatch[0]].children.find(c => c.id === parentName)) {
+                                mdbNodes[mdbMatch[0]].children.push(parentNode);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (!parentNode) {
+            console.warn(`Parent node not found for special ESMDBs: ${parentName}`);
+            return;
+        }
+        
+        // Create group nodes for each special ESMDB type
+        specialESMDBs.forEach(esmdbType => {
+            if (copyCounts[esmdbType]) {
+                const count = copyCounts[esmdbType];
+                
+                // Check if group node already exists
+                const groupId = `${parentName}_${esmdbType}_group`;
+                if (parentNode.children.find(c => c.id === groupId)) return;
+                
+                // Find the ESMDB item data
+                const esmdbItem = allDataArray.find(d => (d.Itemdrop || d.MDB) === esmdbType);
+                const kind = esmdbItem ? (esmdbItem.KIND || 'ESMDB') : 'ESMDB';
+                // Get load from LOAD column (try both cases for column name)
+                const load = esmdbItem ? ((esmdbItem.Load !== undefined && esmdbItem.Load !== null && esmdbItem.Load !== '') 
+                    ? esmdbItem.Load 
+                    : ((esmdbItem.LOAD !== undefined && esmdbItem.LOAD !== null && esmdbItem.LOAD !== '') ? esmdbItem.LOAD : '0 kW')) : '0 kW';
+                const estimate = esmdbItem ? (esmdbItem.Estimate || 0) : 0;
+                const mdb = esmdbItem ? (esmdbItem.MDB || '') : '';
+                
+                // Create group node
+                const groupNode = {
+                    name: `${esmdbType} (${count} copies)`,
+                    id: groupId,
+                    kind: kind,
+                    load: load,
+                    estimate: estimate,
+                    mdb: normalizeMDB(mdb),
+                    data: esmdbItem ? { ...esmdbItem, copyCount: count, fedFromParent: parentName, isGroup: true } : { copyCount: count, fedFromParent: parentName, isGroup: true },
+                    groupCount: count,
+                    collapsed: true,
+                    children: []
+                };
+                
+                parentNode.children.push(groupNode);
+            }
+        });
+    });
+    
+    // Filter out duplicate MDB nodes: remove "MDB" from MDB1 children, "MDB.GF.04" from MDB4 children
+    function filterDuplicateMDBChildren(node) {
+        if (!node.children || node.children.length === 0) return;
+        
+        // Filter children based on parent node
+        if (node.name === 'MDB1' || node.id === 'MDB1') {
+            // Remove "MDB" or "MDB1" children from MDB1
+            node.children = node.children.filter(child => {
+                const childName = (child.name || '').toString().trim();
+                const childId = (child.id || '').toString().trim();
+                return childName !== 'MDB' && childName !== 'MDB1' && 
+                       childId !== 'MDB' && childId !== 'MDB1';
+            });
+        } else if (node.name === 'MDB4' || node.id === 'MDB4') {
+            // Remove "MDB.GF.04" or "MDB4" children from MDB4
+            node.children = node.children.filter(child => {
+                const childName = (child.name || '').toString().trim();
+                const childId = (child.id || '').toString().trim();
+                return childName !== 'MDB.GF.04' && childName !== 'MDB GF 04' && 
+                       childName !== 'MDB4' &&
+                       childId !== 'MDB.GF.04' && childId !== 'MDB GF 04' && 
+                       childId !== 'MDB4';
+            });
+        }
+        
+        // Recursively filter children
+        node.children.forEach(child => filterDuplicateMDBChildren(child));
+    }
+    
+    // Apply filter to remove duplicate MDB nodes
+    filterDuplicateMDBChildren(rmuNode);
     
     treeData = rmuNode;
     root = d3.hierarchy(treeData);
@@ -599,7 +1621,17 @@ function initializeDiagram() {
                 return 'normal';
             })
             .text(d => {
-                const name = d.data.name;
+                let name = d.data.name;
+                // Normalize MDB names for display - remove "MDB" from MDB1, "MDB.GF.04" from MDB4
+                // Check if this is a child MDB node that should be normalized
+                if (name === 'MDB' && d.parent && d.parent.data && (d.parent.data.name === 'MDB1' || d.parent.data.id === 'MDB1')) {
+                    name = 'MDB1';
+                } else if ((name === 'MDB.GF.04' || name === 'MDB GF 04') && d.parent && d.parent.data && (d.parent.data.name === 'MDB4' || d.parent.data.id === 'MDB4')) {
+                    name = 'MDB4';
+                } else {
+                    // Apply general normalization
+                    name = normalizeMDB(name);
+                }
                 // Don't truncate group nodes (they contain copy counts)
                 if (d.data.isGroup || name.includes('copies')) {
                     return name;
@@ -612,8 +1644,21 @@ function initializeDiagram() {
             .style('cursor', d => d.data.data ? 'pointer' : 'default')
             .on('click', function(event, d) {
                 event.stopPropagation();
+                // Handle MDB nodes - they should be clickable
                 if (d.data.data) {
                     openDetailedPage(d.data.data, d.data.name);
+                } else if (d.data.kind === 'MDB' && d.data.name) {
+                    // MDB nodes should be clickable - use data from node
+                    const mdbData = d.data.data || {
+                        Itemdrop: d.data.name,
+                        MDB: d.data.name,
+                        KIND: 'MDB',
+                        Load: d.data.load || '0 kW',
+                        Estimate: d.data.estimate || 0,
+                        'NO OF ITEMS': 0,
+                        'FED FROM': 'RMU'
+                    };
+                    openDetailedPage(mdbData, d.data.name);
                 }
             });
         
@@ -711,8 +1756,26 @@ function initializeDiagram() {
         }
         
         // Double click on node circle opens detailed page (fallback)
-        if (event.detail === 2 && d.data.data) {
-            openDetailedPage(d.data.data, d.data.name);
+        // Also handle MDB nodes (MDB1, MDB2, MDB3, MDB4) - they should be clickable
+        if (event.detail === 2) {
+            if (d.data.data) {
+                openDetailedPage(d.data.data, d.data.name);
+            } else if (d.data.kind === 'MDB' && d.data.name) {
+                // MDB nodes should be clickable - use data from node
+                // Get load from node data or use LOAD column from TOTALLIST
+                const nodeLoad = d.data.load || '0 kW';
+                const mdbData = d.data.data || {
+                    Itemdrop: d.data.name,
+                    MDB: d.data.name,
+                    KIND: 'MDB',
+                    Load: nodeLoad,
+                    LOAD: nodeLoad, // Also set LOAD for consistency
+                    Estimate: d.data.estimate || 0,
+                    'NO OF ITEMS': 0,
+                    'FED FROM': 'RMU'
+                };
+                openDetailedPage(mdbData, d.data.name);
+            }
         }
         
         update(d);
@@ -729,7 +1792,7 @@ function initializeDiagram() {
                 kind: d.data.kind,
                 load: d.data.load,
                 estimate: d.data.estimate,
-                mdb: d.data.mdb,
+                mdb: normalizeMDB(d.data.mdb),
                 data: { ...d.data.data, copyNumber: i },
                 children: null
             });
@@ -837,147 +1900,57 @@ function updateStats() {
     let totalLoad = 0;
     let totalEstimate = 0;
     
-    // Find the NET TOTAL or TOTAL row from the totallist table - use that as the source of truth
-    // The estimate column in totallist table should be used directly
-    let tableTotalEstimate = null;
-    let foundTotalRow = null;
-    
-    // Search through all data to find NET TOTAL or TOTAL row
-    // Check both Itemdrop and MDB fields, and also check KIND field
-    for (let i = data.length - 1; i >= 0; i--) {
-        const item = data[i];
-        const itemdrop = (item.Itemdrop || '').toString().toLowerCase().trim();
-        const mdb = (item.MDB || '').toString().toLowerCase().trim();
-        const kind = (item.KIND || '').toString().toLowerCase().trim();
-        
-        // Check if this is a NET TOTAL row
-        if (itemdrop === 'net total' || mdb === 'net total' || kind === 'net total') {
-            tableTotalEstimate = parseFloat(item.Estimate) || 0;
-            foundTotalRow = item;
-            console.log('Found NET TOTAL row:', {
-                Itemdrop: item.Itemdrop,
-                MDB: item.MDB,
-                KIND: item.KIND,
-                Estimate: tableTotalEstimate
-            });
-            break;
-        }
-    }
-    
-    // If NET TOTAL not found, look for TOTAL (but not "SUM AFTER TOTAL" or similar)
-    if (tableTotalEstimate === null || tableTotalEstimate === 0) {
-        for (let i = data.length - 1; i >= 0; i--) {
-            const item = data[i];
-            const itemdrop = (item.Itemdrop || '').toString().toLowerCase().trim();
-            const mdb = (item.MDB || '').toString().toLowerCase().trim();
-            const kind = (item.KIND || '').toString().toLowerCase().trim();
-            
-            // Check for exact "total" match (not "sum after total" or similar)
-            if ((itemdrop === 'total' || mdb === 'total' || kind === 'total') &&
-                !itemdrop.includes('sum after') && 
-                !itemdrop.includes('net') &&
-                !mdb.includes('sum after') &&
-                !mdb.includes('net')) {
-                tableTotalEstimate = parseFloat(item.Estimate) || 0;
-                foundTotalRow = item;
-                console.log('Found TOTAL row:', {
-                    Itemdrop: item.Itemdrop,
-                    MDB: item.MDB,
-                    KIND: item.KIND,
-                    Estimate: tableTotalEstimate
-                });
-                break;
-            }
-        }
-    }
-    
-    // If still not found, check for rows with empty Itemdrop/MDB but high estimate (likely the total row)
-    if (tableTotalEstimate === null || tableTotalEstimate === 0) {
-        // Look for rows with empty Itemdrop/MDB/KIND but with a high estimate value
-        // This is often how total rows are stored in Excel exports
-        for (let i = data.length - 1; i >= 0; i--) {
-            const item = data[i];
-            const itemdrop = (item.Itemdrop || '').toString().trim();
-            const mdb = (item.MDB || '').toString().trim();
-            const kind = (item.KIND || '').toString().trim();
-            const estimate = parseFloat(item.Estimate) || 0;
-            
-            // If all name fields are empty but estimate is very high (likely the total)
-            if ((!itemdrop || itemdrop === '') && 
-                (!mdb || mdb === '') && 
-                (!kind || kind === '') &&
-                estimate > 1000000) {
-                tableTotalEstimate = estimate;
-                foundTotalRow = item;
-                console.log('Found total row (empty fields, high estimate):', {
-                    Itemdrop: item.Itemdrop,
-                    MDB: item.MDB,
-                    KIND: item.KIND,
-                    Estimate: tableTotalEstimate
-                });
-                break;
-            }
-        }
-    }
-    
-    // Debug: Log all rows with "total" in their name to help identify the correct row
-    if (!foundTotalRow) {
-        console.log('Searching for total rows...');
-        const totalRows = data.filter(item => {
-            const itemdrop = (item.Itemdrop || '').toString().toLowerCase();
-            const mdb = (item.MDB || '').toString().toLowerCase();
-            return itemdrop.includes('total') || mdb.includes('total');
+    // Calculate Total Load: Sum of loads from MDB1, MDB2, MDB3, MDB4 only
+    const mdbNames = ['MDB1', 'MDB2', 'MDB3', 'MDB4'];
+    mdbNames.forEach(mdbName => {
+        const mdbItem = data.find(item => {
+            const itemName = normalizeMDB(item.Itemdrop || item.MDB || '');
+            return itemName === mdbName || item.Itemdrop === mdbName || item.MDB === mdbName;
         });
-        console.log('Rows containing "total":', totalRows.map(item => ({
-            Itemdrop: item.Itemdrop,
-            MDB: item.MDB,
-            KIND: item.KIND,
-            Estimate: item.Estimate
-        })));
         
-        // Also check last few rows with high estimates
-        console.log('Last 5 rows:', data.slice(-5).map(item => ({
-            Itemdrop: item.Itemdrop,
-            MDB: item.MDB,
-            KIND: item.KIND,
-            Estimate: item.Estimate
-        })));
-    }
+        if (mdbItem) {
+            // Get load from LOAD column (try both cases for column name)
+            const loadValue = (mdbItem.Load !== undefined && mdbItem.Load !== null && mdbItem.Load !== '') 
+                ? mdbItem.Load 
+                : ((mdbItem.LOAD !== undefined && mdbItem.LOAD !== null && mdbItem.LOAD !== '') ? mdbItem.LOAD : '0 kW');
+            const loadNum = parseLoadValue(loadValue);
+            totalLoad += loadNum;
+            logger.log(`MDB Load: ${mdbName} = ${loadNum.toFixed(2)} kW`);
+        } else {
+            logger.warn(`MDB not found: ${mdbName}`);
+        }
+    });
     
-    // Calculate total load (sum individual items for load)
+    // Calculate Total Estimate: Sum of all Estimate column values in TOTALLIST sheet
+    // Exclude total rows and empty rows
     data.forEach(item => {
         const itemName = item.Itemdrop || item.MDB || '';
         
-        // Skip items with no name
+        // Skip empty rows
         if (!itemName || itemName.trim() === '') {
             return;
         }
         
-        // Skip MDB reference entries
-        if (['MDB1', 'MDB2', 'MDB3', 'MDB4'].includes(itemName)) {
+        // Skip total rows
+        const itemdropLower = itemName.toLowerCase().trim();
+        if (itemdropLower === 'total' || itemdropLower === 'net total' || 
+            itemdropLower.includes('sum after')) {
             return;
         }
         
-        const loadStr = item.Load || '0 kW';
-        const loadValue = parseFloat(loadStr.replace(/[^\d.]/g, '')) || 0;
-        totalLoad += loadValue;
+        // Get estimate directly from ESTIMATE column
+        const estimateValue = item.Estimate || item.ESTIMATE; // Try both cases
+        if (estimateValue !== null && estimateValue !== undefined && estimateValue !== '') {
+            const parsed = parseFloat(estimateValue);
+            if (!isNaN(parsed)) {
+                totalEstimate += parsed;
+            }
+        }
     });
     
-    // Use table total estimate directly from totallist table (includes special DB values)
-    if (tableTotalEstimate !== null && tableTotalEstimate > 0) {
-        totalEstimate = tableTotalEstimate;
-        console.log('Using table total estimate from totallist:', totalEstimate);
-    } else {
-        // Fallback: if no total row found, calculate from all items
-        console.warn('NET TOTAL or TOTAL row not found in data, calculating from items');
-        data.forEach(item => {
-            const itemName = item.Itemdrop || item.MDB || '';
-            if (!itemName || itemName.trim() === '') return;
-            if (['MDB1', 'MDB2', 'MDB3', 'MDB4'].includes(itemName)) return;
-            totalEstimate += parseFloat(item.Estimate) || 0;
-        });
-    }
-
+    logger.log(`Total Estimate: Sum of all Estimate column values = ${totalEstimate.toFixed(2)}`);
+    logger.log(`Total Load: Sum of MDB1, MDB2, MDB3, MDB4 loads = ${totalLoad.toFixed(2)} kW`);
+    
     document.getElementById('totalItems').textContent = totalItems;
     document.getElementById('totalLoad').textContent = totalLoad.toFixed(2) + ' kW';
     document.getElementById('totalEstimate').textContent = formatNumber(totalEstimate);
@@ -998,11 +1971,23 @@ function populateFilters() {
 }
 
 function formatNumber(num) {
-    if (!num) return 'N/A';
+    // Handle null, undefined, empty string, or NaN
+    if (num === null || num === undefined || num === '' || (typeof num === 'number' && isNaN(num))) {
+        return 'N/A';
+    }
+    // Handle 0 as a valid number
+    if (num === 0 || num === '0') {
+        return '0.00';
+    }
+    // Convert to number if it's a string
+    const numValue = typeof num === 'string' ? parseFloat(num) : num;
+    if (isNaN(numValue)) {
+        return 'N/A';
+    }
     return new Intl.NumberFormat('en-US', {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2
-    }).format(num);
+    }).format(numValue);
 }
 
 function showDetails(item) {
@@ -1030,7 +2015,7 @@ function showDetails(item) {
         </div>
         <div class="detail-item">
             <div class="detail-label">MDB:</div>
-            <div class="detail-value">${item.MDB || 'N/A'}</div>
+            <div class="detail-value">${normalizeMDB(item.MDB) || 'N/A'}</div>
         </div>
         <div class="detail-item">
             <div class="detail-label">Fed From:</div>
@@ -1038,7 +2023,9 @@ function showDetails(item) {
         </div>
         <div class="detail-item">
             <div class="detail-label">Load:</div>
-            <div class="detail-value">${item.Load || 'N/A'}</div>
+            <div class="detail-value">${(item.Load !== undefined && item.Load !== null && item.Load !== '') 
+                ? item.Load 
+                : ((item.LOAD !== undefined && item.LOAD !== null && item.LOAD !== '') ? item.LOAD : 'N/A')}</div>
         </div>
         <div class="detail-item">
             <div class="detail-label">Number of Items:</div>
@@ -1077,8 +2064,12 @@ function openDetailedPage(item, nodeName, sourceView = 'main') {
     // Show detailed page
     detailedPage.classList.remove('hidden');
     
-    // Set title
-    const itemName = item ? (item.Itemdrop || item.MDB || nodeName) : nodeName || 'N/A';
+    // Set title - normalize MDB names
+    let itemName = item ? (item.Itemdrop || item.MDB || nodeName) : nodeName || 'N/A';
+    // Normalize MDB names for display (MDB -> MDB1, MDB.GF.04 -> MDB4)
+    if (itemName === 'MDB' || itemName === 'MDB.GF.04') {
+        itemName = normalizeMDB(itemName);
+    }
     detailedTitle.textContent = itemName;
     
     // Display metadata (use item if available, otherwise create minimal metadata)
@@ -1099,25 +2090,42 @@ function openDetailedPage(item, nodeName, sourceView = 'main') {
     // Load and display detailed data from Excel sheet
     detailedDataContent.innerHTML = '<div class="loading">Loading detailed data...</div>';
     
+    // Normalize sheet name for MDB nodes
+    let sheetName = itemName;
+    if (itemName === 'MDB') {
+        sheetName = 'MDB1'; // MDB sheet should be treated as MDB1
+    } else if (itemName === 'MDB.GF.04') {
+        sheetName = 'MDB4'; // MDB.GF.04 should be treated as MDB4
+    }
+    
     // Check if this is a special DB that needs recalculation
-    const specialDBs = ['DB.TN.LXX.1B1.01', 'DB.TN.LXX.2B1.01', 'DB.TN.LXX.3B1.01'];
+    const specialDBs = ['DB.TN.LXX.1B1.01', 'DB.TN.LXX.2B1.01', 'DB.TN.LXX.3B1.01', 'DB.TH.GF.01'];
     const isSpecialDB = specialDBs.includes(itemName);
     
     if (isSpecialDB && item) {
-        // Find the parent SMDB from the tree structure
-        const smdbName = findParentSMDB(itemName, item);
-        if (smdbName) {
-            const copyCounts = getDBCopyCounts(smdbName);
-            const noOfUnits = copyCounts && copyCounts[itemName] ? copyCounts[itemName] : 1;
-            // Load with recalculation
-            loadDetailedDataWithRecalculation(itemName, detailedDataContent, noOfUnits);
-        } else {
-            // Fallback to normal loading
-            loadDetailedData(itemName, detailedDataContent);
+        // Use NO OF ITEMS from TOTALLIST sheet (same as NO OF UNITS)
+        // Try both 'NO OF ITEMS' and 'NO OF UNITS' column names, and also check copy counts as fallback
+        let noOfItems = item['NO OF ITEMS'] || item['NO OF UNITS'];
+        
+        // If not found in item, try to get from copy counts (fallback)
+        if (!noOfItems || noOfItems === 0) {
+            const smdbName = findParentSMDB(itemName, item);
+            if (smdbName) {
+                const copyCounts = getDBCopyCounts(smdbName);
+                noOfItems = copyCounts && copyCounts[itemName] ? copyCounts[itemName] : 1;
+            } else {
+                noOfItems = 1; // Default fallback
+            }
         }
+        
+        // Convert to number if it's a string
+        const noOfUnits = typeof noOfItems === 'string' ? parseFloat(noOfItems) || 1 : (noOfItems || 1);
+        
+        // Load with recalculation using NO OF ITEMS value
+        loadDetailedDataWithRecalculation(itemName, detailedDataContent, noOfUnits);
     } else {
-        // Normal loading (SMDBs and other items show as-is)
-        loadDetailedData(itemName, detailedDataContent);
+        // Normal loading (SMDBs, MDBs, and other items show as-is)
+        loadDetailedData(sheetName, detailedDataContent);
     }
 }
 
@@ -1170,6 +2178,92 @@ function displayMetadata(item, container) {
     const itemName = item.Itemdrop || item.MDB || 'N/A';
     const fedFrom = isCopy ? item.fedFromSMDB : (item['FED FROM'] || 'N/A');
     
+    // Get load value
+    const itemLoad = (item.Load !== undefined && item.Load !== null && item.Load !== '') 
+        ? item.Load 
+        : ((item.LOAD !== undefined && item.LOAD !== null && item.LOAD !== '') ? item.LOAD : 'N/A');
+    
+    // Check if this is a board (MDB, SMDB, ESMDB, MCC, etc.) and validate load against children
+    // Apply validation to all boards until DB level
+    let loadValidationHtml = '';
+    const kind = (item.KIND || '').toString().toUpperCase();
+    const normalizedMDB = normalizeMDB(itemName);
+    
+    // Check if this is a board type that should have load validation (not DB level)
+    const isBoardType = kind === 'MDB' || 
+                        kind === 'SMDB' || 
+                        kind === 'ESMDB' || 
+                        kind === 'MCC' ||
+                        kind === 'BUS BAR RAISER' ||
+                        kind === 'EMDB' ||
+                        kind === 'EMCC';
+    
+    if (isBoardType) {
+        // Get board's base load and number of units
+        const boardBaseLoad = parseLoadValue(itemLoad);
+        const boardNoOfUnits = parseFloat(item['NO OF ITEMS'] || item['NO OF UNITS'] || 1);
+        // Board's effective load = base load × number of units
+        const boardLoad = boardBaseLoad * boardNoOfUnits;
+        
+        // Calculate children load sum asynchronously (will load detailed sheets for DBs)
+        calculateChildrenLoadSum(itemName).then(childrenLoadSum => {
+            if (boardLoad > 0 && childrenLoadSum > 0) {
+                const difference = Math.abs(boardLoad - childrenLoadSum);
+                const percentageDiff = (difference / boardLoad) * 100;
+                const tolerancePercent = 5; // ±5% tolerance
+                
+                let validationRow = '';
+                if (percentageDiff > tolerancePercent) {
+                    // Load mismatch detected (>5% difference)
+                    const statusColor = '#f44336'; // Red for >5% difference
+                    validationRow = `
+                        <tr style="background-color: ${statusColor}20;">
+                            <td colspan="2" style="padding: 8px; color: ${statusColor}; font-weight: 600;">
+                                ⚠ Load Validation: ${kind} Load (${boardBaseLoad.toFixed(2)} kW × ${boardNoOfUnits} = ${boardLoad.toFixed(2)} kW) vs Sum of Children (${childrenLoadSum.toFixed(2)} kW)
+                                <br>Difference: ${difference.toFixed(2)} kW (${percentageDiff.toFixed(2)}%) - Exceeds ±5% tolerance
+                            </td>
+                        </tr>
+                    `;
+                    console.warn(`Load mismatch for ${itemName} (${kind}): Board=${boardBaseLoad.toFixed(2)} kW × ${boardNoOfUnits} = ${boardLoad.toFixed(2)} kW, Children Sum=${childrenLoadSum.toFixed(2)} kW, Diff=${difference.toFixed(2)} kW (${percentageDiff.toFixed(2)}%)`);
+                } else {
+                    // Load matches (within ±5% tolerance)
+                    validationRow = `
+                        <tr style="background-color: #4CAF5020;">
+                            <td colspan="2" style="padding: 8px; color: #4CAF50; font-weight: 600;">
+                                ✓ Load Validation: ${kind} Load (${boardBaseLoad.toFixed(2)} kW × ${boardNoOfUnits} = ${boardLoad.toFixed(2)} kW) ≈ Sum of Children (${childrenLoadSum.toFixed(2)} kW)
+                                <br>Difference: ${difference.toFixed(2)} kW (${percentageDiff.toFixed(2)}%) - Within ±5% tolerance
+                            </td>
+                        </tr>
+                    `;
+                    console.log(`Load validated for ${itemName} (${kind}): Board=${boardBaseLoad.toFixed(2)} kW × ${boardNoOfUnits} = ${boardLoad.toFixed(2)} kW, Children Sum=${childrenLoadSum.toFixed(2)} kW, Diff=${difference.toFixed(2)} kW (${percentageDiff.toFixed(2)}%)`);
+                }
+                
+                // Update the metadata table with validation result
+                const metadataTable = container.querySelector('.metadata-table');
+                if (metadataTable) {
+                    const tbody = metadataTable.querySelector('tbody') || metadataTable;
+                    tbody.insertAdjacentHTML('beforeend', validationRow);
+                }
+            } else if (boardLoad > 0 && childrenLoadSum === 0) {
+                // Board has load but no children to compare
+                const validationRow = `
+                    <tr style="background-color: #99920;">
+                        <td colspan="2" style="padding: 8px; color: #999; font-weight: 600;">
+                            ⓘ Load Validation: ${kind} Load (${boardBaseLoad.toFixed(2)} kW × ${boardNoOfUnits} = ${boardLoad.toFixed(2)} kW) - No children to compare
+                        </td>
+                    </tr>
+                `;
+                const metadataTable = container.querySelector('.metadata-table');
+                if (metadataTable) {
+                    const tbody = metadataTable.querySelector('tbody') || metadataTable;
+                    tbody.insertAdjacentHTML('beforeend', validationRow);
+                }
+            }
+        }).catch(error => {
+            console.error(`Error calculating children load sum for ${itemName}:`, error);
+        });
+    }
+    
     container.innerHTML = `
         <table class="metadata-table">
             <tr>
@@ -1188,7 +2282,7 @@ function displayMetadata(item, container) {
             </tr>
             <tr>
                 <td>MDB</td>
-                <td>${item.MDB || 'N/A'}</td>
+                <td>${normalizeMDB(item.MDB) || 'N/A'}</td>
             </tr>
             <tr>
                 <td>Fed From</td>
@@ -1196,8 +2290,9 @@ function displayMetadata(item, container) {
             </tr>
             <tr>
                 <td>Load</td>
-                <td>${item.Load || 'N/A'}</td>
+                <td>${itemLoad}</td>
             </tr>
+            ${loadValidationHtml}
             <tr>
                 <td>Number of Items</td>
                 <td>${item['NO OF ITEMS'] || 'N/A'}</td>
@@ -1213,7 +2308,7 @@ function displayMetadata(item, container) {
 // Load detailed data from Excel sheet
 function loadDetailedData(itemName, container) {
     // Try to fetch the Excel file
-    fetch('e2.xlsx')
+    fetch(EXCEL_FILE_NAME)
         .then(response => {
             if (!response.ok) {
                 throw new Error('Excel file not found');
@@ -1240,7 +2335,7 @@ function loadDetailedData(itemName, container) {
 // Load detailed data with recalculation for special DBs
 function loadDetailedDataWithRecalculation(dbName, container, noOfUnits) {
     // Try to fetch the Excel file
-    fetch('e2.xlsx')
+    fetch(EXCEL_FILE_NAME)
         .then(response => {
             if (!response.ok) {
                 throw new Error('Excel file not found');
@@ -1304,12 +2399,24 @@ function loadNormalSheet(itemName, container, workbook) {
     const sheetNames = workbook.SheetNames;
     let sheetName = null;
     
-    // Try exact match first
-    if (sheetNames.includes(itemName)) {
+    // Normalize MDB sheet names
+    let searchName = itemName;
+    if (itemName === 'MDB') {
+        searchName = 'MDB1'; // MDB sheet should be treated as MDB1
+    } else if (itemName === 'MDB.GF.04') {
+        searchName = 'MDB4'; // MDB.GF.04 should be treated as MDB4
+    }
+    
+    // Try exact match first (both original and normalized)
+    if (sheetNames.includes(searchName)) {
+        sheetName = searchName;
+    } else if (sheetNames.includes(itemName)) {
         sheetName = itemName;
     } else {
         // Try to find sheet that contains the item name
         sheetName = sheetNames.find(name => 
+            name.toLowerCase().includes(searchName.toLowerCase()) ||
+            searchName.toLowerCase().includes(name.toLowerCase()) ||
             name.toLowerCase().includes(itemName.toLowerCase()) ||
             itemName.toLowerCase().includes(name.toLowerCase())
         );
@@ -1317,7 +2424,7 @@ function loadNormalSheet(itemName, container, workbook) {
     
     // If no match, try to find a sheet with similar pattern
     if (!sheetName) {
-        const baseName = itemName.split('.')[0] || itemName;
+        const baseName = searchName.split('.')[0] || searchName;
         sheetName = sheetNames.find(name => 
             name.toLowerCase().includes(baseName.toLowerCase())
         );
@@ -1343,6 +2450,7 @@ function loadNormalSheet(itemName, container, workbook) {
 
 
 // Calculate DB estimate based on formula
+// Note: NO OF UNITS parameter is the same as NO OF ITEMS from TOTALLIST sheet
 function calculateDBEstimate(dbData, noOfUnits) {
     if (!dbData || dbData.length === 0) return null;
     
@@ -1698,6 +2806,46 @@ function displayDetailedTableWithRecalculation(data, container, sheetName, calcu
     
     // Display with modified rows, but use a flag to preserve calculation rows
     displayDetailedTable(modifiedRows, container, sheetName, headers, true);
+    
+    // Update metadata with NET TOTAL and NO OF UNITS from calculation
+    if (calculation && (calculation.netTotal !== undefined || calculation.noOfUnits !== undefined)) {
+        const metadataContent = document.getElementById('metadata-content');
+        if (metadataContent) {
+            const metadataTable = metadataContent.querySelector('.metadata-table');
+            if (metadataTable) {
+                // Update Estimate with NET TOTAL
+                if (calculation.netTotal !== undefined && calculation.netTotal !== null) {
+                    const estimateRow = Array.from(metadataTable.querySelectorAll('tr')).find(tr => {
+                        const firstCell = tr.querySelector('td');
+                        return firstCell && firstCell.textContent.trim() === 'Estimate';
+                    });
+                    if (estimateRow) {
+                        const estimateCell = estimateRow.querySelectorAll('td')[1];
+                        if (estimateCell) {
+                            estimateCell.textContent = formatNumber(calculation.netTotal);
+                            console.log('Updated metadata Estimate from calculation to:', calculation.netTotal);
+                        }
+                    }
+                }
+                
+                // Update Number of Items with NO OF UNITS
+                if (calculation.noOfUnits !== undefined && calculation.noOfUnits !== null) {
+                    const noOfItemsRow = Array.from(metadataTable.querySelectorAll('tr')).find(tr => {
+                        const firstCell = tr.querySelector('td');
+                        return firstCell && (firstCell.textContent.trim() === 'Number of Items' || 
+                                           firstCell.textContent.trim() === 'NO OF ITEMS');
+                    });
+                    if (noOfItemsRow) {
+                        const noOfItemsCell = noOfItemsRow.querySelectorAll('td')[1];
+                        if (noOfItemsCell) {
+                            noOfItemsCell.textContent = calculation.noOfUnits.toString();
+                            console.log('Updated metadata Number of Items from calculation to:', calculation.noOfUnits);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Display detailed data as table
@@ -1920,6 +3068,98 @@ function displayDetailedTable(data, container, sheetName, providedHeaders = null
     
     html += '</tbody></table>';
     container.innerHTML = html;
+    
+    // Extract NET TOTAL and NO OF UNITS from the table and update metadata
+    let netTotal = null;
+    let noOfUnits = null;
+    let sumAfterLabourIndex = -1;
+    
+    // First pass: find SUM AFTER LABOUR row index
+    filteredRows.forEach((row, rowIndex) => {
+        const itemValue = itemColumnIndex !== -1 ? row[itemColumnIndex] : '';
+        if (itemValue) {
+            const itemStr = itemValue.toString().toLowerCase().trim();
+            if (itemStr.includes('sum after labour') || itemStr.includes('sum after labor')) {
+                sumAfterLabourIndex = rowIndex;
+            }
+        }
+    });
+    
+    // Second pass: extract NET TOTAL and NO OF UNITS
+    filteredRows.forEach((row, rowIndex) => {
+        const itemValue = itemColumnIndex !== -1 ? row[itemColumnIndex] : '';
+        const amountValue = amountColumnIndex !== -1 ? row[amountColumnIndex] : null;
+        
+        if (itemValue) {
+            const itemStr = itemValue.toString().toLowerCase().trim();
+            
+            // Find NET TOTAL
+            if ((itemStr.includes('net') && itemStr.includes('total')) || itemStr === 'net total') {
+                if (amountValue !== null && amountValue !== undefined && amountValue !== '') {
+                    const parsed = parseFloat(amountValue);
+                    if (!isNaN(parsed)) {
+                        netTotal = parsed;
+                        console.log('Extracted NET TOTAL from detailed sheet:', netTotal);
+                    }
+                }
+            }
+            
+            // Find NO OF UNITS - should be the row immediately after SUM AFTER LABOUR
+            if (sumAfterLabourIndex !== -1 && rowIndex === sumAfterLabourIndex + 1) {
+                // Check if this row contains NO OF UNITS
+                if (itemStr === 'no of units' || itemStr === 'number of units' || 
+                    (itemStr.includes('no') && itemStr.includes('units') && !itemStr.includes('sum after'))) {
+                    if (amountValue !== null && amountValue !== undefined && amountValue !== '') {
+                        const parsed = parseFloat(amountValue);
+                        if (!isNaN(parsed)) {
+                            noOfUnits = parsed;
+                            console.log('Extracted NO OF UNITS from detailed sheet (after SUM AFTER LABOUR):', noOfUnits);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
+    // Update metadata if values were found
+    if (netTotal !== null || noOfUnits !== null) {
+        const metadataContent = document.getElementById('metadata-content');
+        if (metadataContent) {
+            const metadataTable = metadataContent.querySelector('.metadata-table');
+            if (metadataTable) {
+                // Update Estimate if NET TOTAL was found
+                if (netTotal !== null) {
+                    const estimateRow = Array.from(metadataTable.querySelectorAll('tr')).find(tr => {
+                        const firstCell = tr.querySelector('td');
+                        return firstCell && firstCell.textContent.trim() === 'Estimate';
+                    });
+                    if (estimateRow) {
+                        const estimateCell = estimateRow.querySelectorAll('td')[1];
+                        if (estimateCell) {
+                            estimateCell.textContent = formatNumber(netTotal);
+                            console.log('Updated metadata Estimate to:', netTotal);
+                        }
+                    }
+                }
+                
+                // Update Number of Items if NO OF UNITS was found
+                if (noOfUnits !== null) {
+                    const noOfItemsRow = Array.from(metadataTable.querySelectorAll('tr')).find(tr => {
+                        const firstCell = tr.querySelector('td');
+                        return firstCell && (firstCell.textContent.trim() === 'Number of Items' || 
+                                           firstCell.textContent.trim() === 'NO OF ITEMS');
+                    });
+                    if (noOfItemsRow) {
+                        const noOfItemsCell = noOfItemsRow.querySelectorAll('td')[1];
+                        if (noOfItemsCell) {
+                            noOfItemsCell.textContent = noOfUnits.toString();
+                            console.log('Updated metadata Number of Items to:', noOfUnits);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Close detailed page and return to diagram
@@ -2048,6 +3288,8 @@ document.getElementById('toggleTreeView').addEventListener('click', () => {
 document.getElementById('closeTreeView').addEventListener('click', () => {
     document.getElementById('tree-sidebar').classList.add('hidden');
 });
+
+// Auto-sync is handled automatically, no refresh button needed
 
 // MDB View button
 document.getElementById('showMDBView').addEventListener('click', () => {
@@ -2195,10 +3437,10 @@ function loadMDBTable(mdbName) {
 
 // Recalculate estimates for special DBs in MDB table
 async function recalculateMDBTableEstimates(tableData) {
-    const specialDBs = ['DB.TN.LXX.1B1.01', 'DB.TN.LXX.2B1.01', 'DB.TN.LXX.3B1.01'];
+    const specialDBs = ['DB.TN.LXX.1B1.01', 'DB.TN.LXX.2B1.01', 'DB.TN.LXX.3B1.01', 'DB.TH.GF.01'];
     
     // Load Excel file once
-    const response = await fetch('e2.xlsx');
+    const response = await fetch(EXCEL_FILE_NAME);
     if (!response.ok) {
         console.warn('Could not load Excel file for recalculation');
         return;
@@ -2235,26 +3477,51 @@ async function recalculateMDBTableEstimates(tableData) {
         }
         
         if (dbName) {
-            // Find parent SMDB from fedFrom
-            const fedFrom = row.fedFrom || '';
-            const smdbList = fedFrom.split('\n').map(p => p.trim()).filter(p => p && p !== 'RMU' && !p.startsWith('MDB'));
+            // Use NO OF ITEMS from TOTALLIST sheet (same as NO OF UNITS)
+            // First try to get from row data (from TOTALLIST)
+            let noOfItems = row.noOfItems || row['NO OF ITEMS'] || row['NO OF UNITS'];
             
-            // If noOfUnits not extracted from group name, get from copy counts
-            if (noOfUnits === 1 && smdbList.length > 0) {
-                const smdbName = smdbList[0];
-                const copyCounts = getDBCopyCounts(smdbName);
-                noOfUnits = copyCounts && copyCounts[dbName] ? copyCounts[dbName] : 1;
+            // If not found in row, try to get from window.allData (TOTALLIST)
+            if (!noOfItems || noOfItems === 0) {
+                if (window.allData) {
+                    const totallistItem = window.allData.find(d => 
+                        (d.Itemdrop || d.MDB) === dbName || 
+                        (d.Itemdrop || d.MDB) === itemName
+                    );
+                    if (totallistItem) {
+                        noOfItems = totallistItem['NO OF ITEMS'] || totallistItem['NO OF UNITS'];
+                    }
+                }
             }
             
-            if (smdbList.length > 0 || noOfUnits > 1) {
-                // Calculate estimate for this DB
+            // If still not found, try copy counts as fallback
+            if (!noOfItems || noOfItems === 0) {
+                const fedFrom = row.fedFrom || '';
+                const smdbList = fedFrom.split('\n').map(p => p.trim()).filter(p => p && p !== 'RMU' && !p.startsWith('MDB'));
+                if (smdbList.length > 0) {
+                    const smdbName = smdbList[0];
+                    const copyCounts = getDBCopyCounts(smdbName);
+                    noOfItems = copyCounts && copyCounts[dbName] ? copyCounts[dbName] : 1;
+                } else {
+                    noOfItems = noOfUnits; // Use the value extracted from group name
+                }
+            }
+            
+            // Convert to number if it's a string
+            const finalNoOfUnits = typeof noOfItems === 'string' ? parseFloat(noOfItems) || 1 : (noOfItems || 1);
+            
+            // Use the extracted noOfUnits from group name if it's greater than 1, otherwise use noOfItems
+            noOfUnits = (noOfUnits > 1) ? noOfUnits : finalNoOfUnits;
+            
+            if (noOfUnits > 0) {
+                // Calculate estimate for this DB using NO OF ITEMS value
                 const calculation = await calculateDBEstimateFromSheet(workbook, dbName, noOfUnits);
                 
                 if (calculation && calculation.netTotal) {
                     // Update the estimate with recalculated NET TOTAL
                     row.estimate = calculation.netTotal;
                     row.recalculated = true;
-                    console.log(`Recalculated ${itemName} (${dbName}, ${noOfUnits} units) estimate: ${calculation.netTotal}`);
+                    console.log(`Recalculated ${itemName} (${dbName}, ${noOfUnits} units from NO OF ITEMS) estimate: ${calculation.netTotal}`);
                 }
             }
         }
@@ -2295,24 +3562,47 @@ function flattenTreeForTable(node, level = 0, parentName = '') {
     
     // Add current node - ensure all properties are populated from data if available
     const nodeData = node.data || {};
+    
+    // Normalize the name - remove "MDB" from MDB1, "MDB.GF.04" from MDB4
+    let normalizedName = node.name;
+    if (normalizedName === 'MDB' && (parentName === 'MDB1' || parentName.startsWith('MDB1'))) {
+        normalizedName = 'MDB1';
+    } else if ((normalizedName === 'MDB.GF.04' || normalizedName === 'MDB GF 04') && (parentName === 'MDB4' || parentName.startsWith('MDB4'))) {
+        normalizedName = 'MDB4';
+    } else {
+        // Apply general normalization
+        normalizedName = normalizeMDB(normalizedName);
+    }
+    
+    // Normalize itemdrop as well
+    let normalizedItemdrop = nodeData.Itemdrop || node.name || '';
+    normalizedItemdrop = normalizeMDB(normalizedItemdrop);
+    
     const row = {
         level: level,
-        name: node.name,
+        name: normalizedName,
         kind: node.kind || nodeData.KIND || 'Unknown',
         load: node.load || nodeData.Load || '0 kW',
         estimate: node.estimate !== undefined ? node.estimate : (nodeData.Estimate || 0),
         fedFrom: parentName || nodeData['FED FROM'] || '',
         noOfItems: nodeData['NO OF ITEMS'] !== undefined ? nodeData['NO OF ITEMS'] : '',
-        itemdrop: nodeData.Itemdrop || node.name || '',
-        mdb: node.mdb || nodeData.MDB || '',
+        itemdrop: normalizedItemdrop,
+        mdb: normalizeMDB(node.mdb || nodeData.MDB || ''),
         data: nodeData
     };
-    rows.push(row);
     
-    // Process children
+    // Filter out duplicate entries: if normalized name matches parent MDB name, skip it
+    // (e.g., if parent is MDB1 and this node is also MDB1 after normalization, skip to avoid duplicate)
+    if (level > 0 && normalizedName === parentName && node.kind === 'MDB') {
+        // Skip this duplicate MDB entry
+    } else {
+        rows.push(row);
+    }
+    
+    // Process children - use normalized name as parent name
     if (node.children && node.children.length > 0) {
         node.children.forEach(child => {
-            const childRows = flattenTreeForTable(child, level + 1, node.name);
+            const childRows = flattenTreeForTable(child, level + 1, normalizedName);
             rows.push(...childRows);
         });
     }
@@ -2334,6 +3624,7 @@ function generateMDBTable(data, mdbName) {
     html += '<th>Name</th>';
     html += '<th>Kind</th>';
     html += '<th>Load</th>';
+    html += '<th>Load Validation</th>';
     html += '<th>No. of Items</th>';
     html += '<th>Fed From</th>';
     html += '<th>Estimate (AED)</th>';
@@ -2357,20 +3648,117 @@ function generateMDBTable(data, mdbName) {
         const collapseId = `collapse-${mdbName}-${groupIndex}`;
         
         // Parent row (SMDB, ESMDB, MCC or other parent)
-        const isClickable = estimate > 0;
-        const clickableClass = isClickable ? 'clickable-row' : 'non-clickable-row';
         // Ensure data is properly serialized - use itemdrop or name to find original data if node.data is empty
         let rowData = parentRow.data || {};
         if (!rowData || Object.keys(rowData).length === 0) {
             // Try to find data from allData if available
             const itemName = parentRow.name || parentRow.itemdrop || '';
             if (itemName && window.allData) {
-                const foundData = window.allData.find(d => (d.Itemdrop || d.MDB) === itemName);
+                // Try exact match first
+                let foundData = window.allData.find(d => {
+                    const itemdrop = (d.Itemdrop || '').toString().trim();
+                    const mdb = (d.MDB || '').toString().trim();
+                    return itemdrop === itemName || mdb === itemName;
+                });
+                
+                // If not found and itemName is MDB1, try finding "MDB" entry
+                if (!foundData && itemName === 'MDB1') {
+                    foundData = window.allData.find(d => {
+                        const itemdrop = (d.Itemdrop || '').toString().trim();
+                        const mdb = (d.MDB || '').toString().trim();
+                        return (itemdrop === 'MDB' || mdb === 'MDB') && 
+                               (d.KIND || '').toString().toUpperCase() === 'MDB';
+                    });
+                }
+                
+                // If not found and itemName is MDB4, try finding "MDB.GF.04" entry
+                if (!foundData && itemName === 'MDB4') {
+                    foundData = window.allData.find(d => {
+                        const itemdrop = (d.Itemdrop || '').toString().trim();
+                        const mdb = (d.MDB || '').toString().trim();
+                        return (itemdrop === 'MDB.GF.04' || mdb === 'MDB.GF.04' || 
+                                itemdrop === 'MDB GF 04' || mdb === 'MDB GF 04') &&
+                               (d.KIND || '').toString().toUpperCase() === 'MDB';
+                    });
+                }
+                
                 if (foundData) {
                     rowData = foundData;
                 }
             }
         }
+        
+        // For MDB nodes (MDB1, MDB2, MDB3, MDB4), make them clickable even if estimate is 0
+        // They should be clickable because they have detailed sheets
+        const isMDBNode = parentRow.kind === 'MDB' && ['MDB1', 'MDB2', 'MDB3', 'MDB4'].includes(parentRow.name);
+        const isClickable = estimate > 0 || isMDBNode;
+        const clickableClass = isClickable ? 'clickable-row' : 'non-clickable-row';
+        
+        // Calculate load validation for board nodes (MDB, SMDB, ESMDB, MCC, etc.) - not for DB level
+        let loadValidationHtml = '<td>-</td>';
+        const kind = (parentRow.kind || '').toString().toUpperCase();
+        const isBoardType = kind === 'MDB' || 
+                           kind === 'SMDB' || 
+                           kind === 'ESMDB' || 
+                           kind === 'MCC' ||
+                           kind === 'BUS BAR RAISER' ||
+                           kind === 'EMDB' ||
+                           kind === 'EMCC';
+        
+        if (isBoardType) {
+            // Get board's base load and number of units
+            const boardBaseLoad = parseLoadValue(parentRow.load || '0 kW');
+            const boardNoOfUnits = parseFloat(parentRow.noOfItems || parentRow['NO OF ITEMS'] || parentRow['NO OF UNITS'] || 1);
+            // Board's effective load = base load × number of units
+            const boardLoad = boardBaseLoad * boardNoOfUnits;
+            
+            // Placeholder for async load validation - will be updated after calculation
+            const validationCellId = `load-validation-${mdbName}-${groupIndex}`;
+            loadValidationHtml = `<td id="${validationCellId}" style="color: #999; font-size: 0.9em;">Calculating...</td>`;
+            
+            // Calculate children load sum asynchronously (will load detailed sheets for DBs)
+            calculateChildrenLoadSum(parentRow.name).then(childrenLoadSum => {
+                const validationCell = document.getElementById(validationCellId);
+                if (!validationCell) return;
+                
+                if (boardLoad > 0 && childrenLoadSum > 0) {
+                    const difference = Math.abs(boardLoad - childrenLoadSum);
+                    const percentageDiff = (difference / boardLoad) * 100;
+                    const tolerancePercent = 5; // ±5% tolerance
+                    
+                    if (percentageDiff > tolerancePercent) {
+                        // Load mismatch detected (>5% difference)
+                        const statusColor = '#f44336'; // Red for >5% difference
+                        validationCell.innerHTML = `⚠ ${boardLoad.toFixed(2)} vs ${childrenLoadSum.toFixed(2)} kW<br>
+                            <span style="font-size: 0.85em;">(${boardBaseLoad.toFixed(2)}×${boardNoOfUnits}) Diff: ${difference.toFixed(2)} kW (${percentageDiff.toFixed(2)}%)</span>`;
+                        validationCell.style.backgroundColor = `${statusColor}20`;
+                        validationCell.style.color = statusColor;
+                        validationCell.style.fontWeight = '600';
+                    } else {
+                        // Load matches (within ±5% tolerance)
+                        validationCell.innerHTML = `✓ ${boardLoad.toFixed(2)} ≈ ${childrenLoadSum.toFixed(2)} kW<br>
+                            <span style="font-size: 0.85em;">(${boardBaseLoad.toFixed(2)}×${boardNoOfUnits}, ${percentageDiff.toFixed(2)}% diff)</span>`;
+                        validationCell.style.backgroundColor = '#4CAF5020';
+                        validationCell.style.color = '#4CAF50';
+                        validationCell.style.fontWeight = '600';
+                    }
+                } else if (boardLoad > 0) {
+                    // Board has load but no children to compare
+                    validationCell.innerHTML = 'No children';
+                    validationCell.style.color = '#999';
+                } else {
+                    validationCell.innerHTML = '-';
+                }
+            }).catch(error => {
+                console.error(`Error calculating children load sum for ${parentRow.name}:`, error);
+                const validationCell = document.getElementById(validationCellId);
+                if (validationCell) {
+                    validationCell.innerHTML = 'Error';
+                    validationCell.style.color = '#999';
+                }
+            });
+        }
+        
         html += `<tr class="mdb-parent-row ${hasChildren && isParentType ? 'has-children' : ''} ${clickableClass}" data-row-id="${rowId}" data-collapse-id="${collapseId}" data-item-name="${parentRow.name || ''}" data-item-data='${JSON.stringify(rowData)}' data-estimate="${estimate}">`;
         html += `<td>${indent}`;
         if (hasChildren && isParentType) {
@@ -2379,6 +3767,7 @@ function generateMDBTable(data, mdbName) {
         html += `${parentRow.name || ''}${isRecalculated ? ' <span style="color: #4CAF50; font-size: 0.85em;">(recalculated)</span>' : ''}</td>`;
         html += `<td><span class="${kindClass}">${parentRow.kind || ''}</span></td>`;
         html += `<td>${parentRow.load || '0 kW'}</td>`;
+        html += loadValidationHtml;
         html += `<td>${parentRow.noOfItems || ''}</td>`;
         html += `<td>${parentRow.fedFrom || ''}</td>`;
         html += `<td class="numeric"${isRecalculated ? ' style="font-weight: 600; color: #4CAF50;"' : ''}>${formatNumber(estimate)}</td>`;
@@ -2410,6 +3799,7 @@ function generateMDBTable(data, mdbName) {
                 html += `<td>${childIndent}${childRow.name || ''}${childIsRecalculated ? ' <span style="color: #4CAF50; font-size: 0.85em;">(recalculated)</span>' : ''}</td>`;
                 html += `<td><span class="${childKindClass}">${childRow.kind || ''}</span></td>`;
                 html += `<td>${childRow.load || '0 kW'}</td>`;
+                html += `<td>-</td>`; // Load validation not applicable for child rows
                 html += `<td>${childRow.noOfItems || ''}</td>`;
                 html += `<td>${childRow.fedFrom || ''}</td>`;
                 html += `<td class="numeric"${childIsRecalculated ? ' style="font-weight: 600; color: #4CAF50;"' : ''}>${formatNumber(childEstimate)}</td>`;
@@ -2496,12 +3886,13 @@ function setupMDBTableCollapse(mdbName) {
             toggle.addEventListener('click', collapseHandler);
         }
         
-        // Add click handler for opening detailed page (for all parent rows with non-zero estimates)
+        // Add click handler for opening detailed page (for all parent rows with non-zero estimates or MDB nodes)
         const itemName = parentRow.getAttribute('data-item-name');
         const itemDataStr = parentRow.getAttribute('data-item-data');
         const rowEstimate = parseFloat(parentRow.getAttribute('data-estimate')) || 0;
+        const isMDBNode = itemName && ['MDB1', 'MDB2', 'MDB3', 'MDB4'].includes(itemName);
         
-        if (itemName && itemDataStr && rowEstimate > 0) {
+        if (itemName && itemDataStr && (rowEstimate > 0 || isMDBNode)) {
             parentRow.style.cursor = 'pointer';
             parentRow.setAttribute('data-click-handler', 'true');
             parentRow.addEventListener('click', function(e) {
@@ -2538,8 +3929,9 @@ function setupMDBTableCollapse(mdbName) {
             return;
         }
         
-        // Only make clickable if estimate > 0 and has valid data
-        if (itemName && itemDataStr && rowEstimate > 0) {
+        // Only make clickable if estimate > 0 and has valid data, or if it's an MDB node
+        const isMDBNode = itemName && ['MDB1', 'MDB2', 'MDB3', 'MDB4'].includes(itemName);
+        if (itemName && itemDataStr && (rowEstimate > 0 || isMDBNode)) {
             row.style.cursor = 'pointer';
             row.setAttribute('data-click-handler', 'true');
             row.addEventListener('click', function(e) {

@@ -7,7 +7,6 @@
     <link rel="stylesheet" href="styles.css">
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-    <script src="data.js"></script>
 </head>
 <body>
     <!-- Password Protection Modal -->
@@ -94,6 +93,9 @@
                     <span class="stat-label">Total Estimate:</span>
                     <span class="stat-value" id="totalEstimate">0</span>
                 </div>
+            </div>
+            <div id="sync-status" class="sync-status" style="text-align: center; margin-top: 10px; font-size: 12px; color: #666;">
+                <span id="sync-indicator">●</span> <span id="sync-text">Syncing with e2.xlsx...</span>
             </div>
         </div>
 
